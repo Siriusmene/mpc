@@ -6877,6 +6877,11 @@ name = "mpc-node"
 version = "1.7.0"
 dependencies = [
  "alloy",
+ "alloy-consensus",
+ "alloy-dyn-abi",
+ "alloy-json-abi",
+ "alloy-primitives",
+ "alloy-rlp",
  "alloy-signer-local",
  "alloy-sol-types",
  "anchor-client",
@@ -6893,6 +6898,7 @@ dependencies = [
  "ciborium",
  "clap",
  "deadpool-redis",
+ "ethers-core",
  "futures-util",
  "google-datastore1",
  "google-secretmanager1",
@@ -6925,6 +6931,8 @@ dependencies = [
  "rand 0.8.5",
  "redis",
  "reqwest 0.11.27",
+ "rlp",
+ "secp256k1 0.28.2",
  "semver 1.0.26",
  "serde",
  "serde_bytes",
