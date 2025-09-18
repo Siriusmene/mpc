@@ -5711,6 +5711,7 @@ dependencies = [
  "secp256k1 0.28.2",
  "serde",
  "serde_json",
+ "sha3",
  "shell-escape",
  "test-log",
  "testcontainers",
