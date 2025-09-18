@@ -218,13 +218,13 @@ fn as_signature(
     Ok((signature, recovery_id))
 }
 
-pub fn public_key_to_address(public_key: &secp256k1::PublicKey) -> web3::types::Address {
+pub fn public_key_to_address(public_key: &secp256k1::PublicKey) -> ethers_core::types::Address {
     let public_key = public_key.serialize_uncompressed();
 
     debug_assert_eq!(public_key[0], 0x04);
     let hash: [u8; 32] = *alloy::primitives::keccak256(&public_key[1..]);
 
-    web3::types::Address::from_slice(&hash[12..])
+    ethers_core::types::Address::from_slice(&hash[12..])
 }
 
 #[cfg(test)]
