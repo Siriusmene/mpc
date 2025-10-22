@@ -1,7 +1,6 @@
-mod cryptography;
-
 pub mod consensus;
 pub mod contract;
+pub mod cryptography;
 pub mod error;
 pub mod message;
 pub mod posit;
@@ -26,7 +25,7 @@ use crate::indexer_sol::SignBidirectionalEvent;
 use crate::mesh::MeshState;
 use crate::protocol::consensus::ConsensusProtocol;
 use crate::protocol::cryptography::CryptographicProtocol;
-use crate::protocol::message::{GeneratingMessage, ResharingMessage};
+use crate::protocol::message::{GeneratingMessage, ReadyMessage, ResharingMessage};
 use crate::respond_bidirectional::RespondBidirectionalTx;
 use crate::rpc::{ContractStateWatcher, RpcChannel};
 use crate::sign_bidirectional::SignBidirectionalSignatureChannel;
@@ -52,6 +51,7 @@ pub struct MpcSignProtocol {
     pub(crate) sign_rx: Arc<RwLock<mpsc::Receiver<IndexedSignRequest>>>,
     pub(crate) generating: mpsc::Receiver<GeneratingMessage>,
     pub(crate) resharing: mpsc::Receiver<ResharingMessage>,
+    pub(crate) ready: mpsc::Receiver<ReadyMessage>,
     pub(crate) msg_channel: MessageChannel,
     pub(crate) rpc_channel: RpcChannel,
     pub(crate) contract: ContractStateWatcher,
@@ -82,7 +82,6 @@ impl MpcSignProtocol {
         mut node: Node,
         mut gov_client: G,
         contract_state: ContractStateWatcher,
-        config: watch::Receiver<Config>,
         mesh_state: watch::Receiver<MeshState>,
     ) {
         let my_account_id = self.my_account_id.as_str();
@@ -102,14 +101,9 @@ impl MpcSignProtocol {
                 .with_label_values(&[my_account_id.as_str()])
                 .inc();
 
-            let cfg = config.borrow().clone();
             let mesh_state = mesh_state.borrow().clone();
-
             let crypto_time = Instant::now();
-            node.state = node
-                .state
-                .progress(&mut self, cfg.clone(), mesh_state.clone())
-                .await;
+            node.state = node.state.progress(&mut self, mesh_state).await;
             node.update_watchers().await;
             crate::metrics::PROTOCOL_LATENCY_ITER_CRYPTO
                 .with_label_values(&[my_account_id.as_str()])

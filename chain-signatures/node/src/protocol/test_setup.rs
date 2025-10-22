@@ -34,6 +34,7 @@ impl MpcSignProtocol {
     ) -> Self {
         let generating = channels.msg_channel.subscribe_generation().await;
         let resharing = channels.msg_channel.subscribe_resharing().await;
+        let ready = channels.msg_channel.subscribe_ready().await;
         Self {
             my_account_id,
             secret_storage: storage.secret_storage,
@@ -43,6 +44,7 @@ impl MpcSignProtocol {
             msg_channel: channels.msg_channel,
             generating,
             resharing,
+            ready,
             rpc_channel: channels.rpc_channel,
             contract,
             config: channels.config,
