@@ -1,12 +1,20 @@
 use crate::protocol::{Chain, IndexedSignRequest};
 use crate::sign_bidirectional::BidirectionalTx;
 use crate::sign_bidirectional::BidirectionalTxId;
+#[cfg(feature = "light_client")]
 use crate::sign_bidirectional::BidirectionalTxStatus;
+#[cfg(feature = "light_client")]
 use crate::sign_bidirectional::TransactionOutput;
+#[cfg(feature = "light_client")]
 use alloy::consensus::Transaction;
+#[cfg(feature = "light_client")]
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::primitives::{Address, Bytes};
+#[cfg(feature = "light_client")]
+use alloy::primitives::Address;
+use alloy::primitives::Bytes;
+#[cfg(feature = "light_client")]
 use alloy::rpc::types::TransactionRequest;
+#[cfg(feature = "light_client")]
 use helios::ethereum::EthereumClient;
 use k256::Scalar;
 use mpc_crypto::ScalarExt;
@@ -21,9 +29,9 @@ use tokio::time::Duration;
 const MAGIC_ERROR_PREFIX: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
 const SOLANA_RESPOND_BIDIRECTIONAL_PATH: &str = "solana response key";
 // Use Borsh as this is what we are using for solana
-const RESPOND_SERIALIZATION_FORMAT: SerDeserFormat = SerDeserFormat::Borsh;
+pub(crate) const RESPOND_SERIALIZATION_FORMAT: SerDeserFormat = SerDeserFormat::Borsh;
 // Use Abi as this is what we are using for ethereum
-const OUTPUT_DESERIALIZATION_FORMAT: SerDeserFormat = SerDeserFormat::Abi;
+pub(crate) const OUTPUT_DESERIALIZATION_FORMAT: SerDeserFormat = SerDeserFormat::Abi;
 
 #[derive(PartialEq)]
 pub enum SerDeserFormat {
@@ -33,6 +41,7 @@ pub enum SerDeserFormat {
 
 pub struct CompletedTx {
     tx: BidirectionalTx,
+    #[cfg(feature = "light_client")]
     block_number: u64,
 }
 
@@ -45,10 +54,37 @@ pub struct RespondBidirectionalTx {
 pub type RespondBidirectionalSerializedOutput = Vec<u8>;
 
 impl CompletedTx {
+    #[cfg_attr(not(feature = "light_client"), allow(unused_variables))]
     pub fn new(tx: BidirectionalTx, block_number: u64) -> Self {
-        Self { tx, block_number }
+        Self {
+            tx,
+            #[cfg(feature = "light_client")]
+            block_number,
+        }
     }
 
+    #[cfg(not(feature = "light_client"))]
+    pub(crate) async fn create_failed_sign_request_without_light_client(
+        &self,
+        signature_generation_total_timeout: Duration,
+    ) -> anyhow::Result<IndexedSignRequest> {
+        self.process_failed_tx(signature_generation_total_timeout)
+            .await
+    }
+
+    #[cfg(not(feature = "light_client"))]
+    pub(crate) fn create_sign_request_from_serialized_output(
+        &self,
+        serialized_output: RespondBidirectionalSerializedOutput,
+        signature_generation_total_timeout: Duration,
+    ) -> anyhow::Result<IndexedSignRequest> {
+        self.create_respond_bidirectional_sign_request(
+            serialized_output,
+            signature_generation_total_timeout,
+        )
+    }
+
+    #[cfg(feature = "light_client")]
     pub async fn create_sign_request_from_completed_tx(
         &self,
         helios_client: &Arc<EthereumClient>,
@@ -80,6 +116,7 @@ impl CompletedTx {
         }
     }
 
+    #[cfg(feature = "light_client")]
     async fn process_completed_tx(
         &self,
         helios_client: &Arc<EthereumClient>,
@@ -128,6 +165,7 @@ impl CompletedTx {
         Ok(sign_request)
     }
 
+    #[cfg(feature = "light_client")]
     async fn process_success_tx(
         &self,
         helios_client: &Arc<EthereumClient>,
@@ -202,6 +240,7 @@ impl CompletedTx {
         })
     }
 
+    #[cfg(feature = "light_client")]
     async fn extract_success_tx_output(
         &self,
         helios_client: &Arc<EthereumClient>,
@@ -248,6 +287,7 @@ fn calculate_respond_bidirectional_hash_message(
     alloy::primitives::keccak256(&combined).into()
 }
 
+#[cfg(feature = "light_client")]
 async fn fetch_call_result(
     helios_client: &Arc<EthereumClient>,
     from_address: Address,
@@ -283,6 +323,7 @@ async fn fetch_call_result(
     }
 }
 
+#[cfg(feature = "light_client")]
 async fn fetch_tx_from_helios(
     helios_client: &Arc<EthereumClient>,
     tx_id: BidirectionalTxId,
