@@ -8,6 +8,7 @@ pub mod mpc_fixture;
 pub mod utils;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use self::local::NodeEnvConfig;
@@ -29,6 +30,29 @@ use near_workspaces::network::Sandbox;
 use near_workspaces::types::{KeyType, SecretKey};
 use near_workspaces::{Account, AccountId, Contract, Worker};
 use serde_json::json;
+
+/// Specifies which binary to use when spawning a node
+#[derive(Clone, Debug)]
+pub enum NodeBinarySource {
+    /// Use the current compiled code from target/release
+    CurrentCode,
+    /// Use the tagged mainnet binary compiled under target/compat/mainnet/<version>
+    Mainnet,
+    /// Use the tagged testnet binary compiled under target/compat/testnet/<version>
+    Testnet,
+}
+
+impl NodeBinarySource {
+    /// Get the binary path for this source
+    pub fn binary_path(&self) -> anyhow::Result<Option<PathBuf>> {
+        match self {
+            // Will use default executable lookup
+            NodeBinarySource::CurrentCode => Ok(None),
+            NodeBinarySource::Mainnet => Ok(Some(execute::compatibility_binary("mainnet")?)),
+            NodeBinarySource::Testnet => Ok(Some(execute::compatibility_binary("testnet")?)),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -560,7 +584,11 @@ pub async fn host(spawner: &mut ClusterSpawner) -> anyhow::Result<Nodes> {
     let node_futures = spawner
         .accounts
         .iter()
-        .map(|account| local::Node::run(&ctx, cfg, account));
+        .zip(std::mem::take(&mut spawner.node_binary_sources).into_iter())
+        .map(|(account, source)| {
+            let binary_path = source.binary_path().unwrap();
+            local::Node::run_with_binary(&ctx, cfg, account, binary_path)
+        });
     let nodes = futures::future::join_all(node_futures)
         .await
         .into_iter()

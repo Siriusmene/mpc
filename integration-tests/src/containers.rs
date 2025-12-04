@@ -87,6 +87,7 @@ impl Node {
                 sign_sk,
                 cfg: cfg.clone(),
                 near_rpc,
+                binary_path: None,
             },
         )
         .await
@@ -103,6 +104,7 @@ impl Node {
             sign_sk: self.sign_sk,
             cfg: self.cfg,
             near_rpc: self.near_rpc,
+            binary_path: None,
         }
     }
 
