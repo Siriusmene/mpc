@@ -83,6 +83,7 @@ pub struct BlockAndRequests {
     block_number: u64,
     block_hash: alloy::primitives::B256,
     indexed_requests: Vec<IndexedSignRequest>,
+    respond_logs: Vec<Log>,
 }
 
 impl BlockAndRequests {
@@ -90,11 +91,13 @@ impl BlockAndRequests {
         block_number: u64,
         block_hash: alloy::primitives::B256,
         indexed_requests: Vec<IndexedSignRequest>,
+        respond_logs: Vec<Log>,
     ) -> Self {
         Self {
             block_number,
             block_hash,
             indexed_requests,
+            respond_logs,
         }
     }
 }
@@ -801,7 +804,6 @@ impl EthereumIndexer {
         let node_near_account_id_clone2 = node_near_account_id.clone();
         let requests_indexed_send_clone = requests_indexed_send.clone();
         let backlog_clone2 = backlog.clone();
-        let sign_tx_clone = sign_tx.clone();
         let client_clone = Arc::clone(&client);
         tokio::spawn(async move {
             Self::retry_failed_blocks(
@@ -813,7 +815,6 @@ impl EthereumIndexer {
                 requests_indexed_send_clone,
                 total_timeout,
                 backlog_clone2,
-                sign_tx_clone,
             )
             .await;
         });
@@ -872,7 +873,6 @@ impl EthereumIndexer {
                 requests_indexed_send_clone.clone(),
                 total_timeout,
                 backlog.clone(),
-                sign_tx.clone(),
             )
             .await
             {
@@ -935,7 +935,6 @@ impl EthereumIndexer {
         requests_indexed: mpsc::Sender<BlockAndRequests>,
         total_timeout: Duration,
         backlog: Backlog,
-        sign_tx: mpsc::Sender<Sign>,
     ) -> anyhow::Result<()> {
         let block_number = block.header.number;
         let block_hash = block.header.hash;
@@ -981,10 +980,6 @@ impl EthereumIndexer {
                     .is_some_and(|topic| *topic == SignatureResponded::SIGNATURE_HASH)
             });
 
-        if !respond_logs.is_empty() {
-            process_respond_events(&respond_logs, &backlog, sign_tx.clone()).await;
-        }
-
         let request_logs: Vec<Log> = potential_request_logs
             .into_iter()
             .filter(|log| {
@@ -1007,7 +1002,7 @@ impl EthereumIndexer {
         .await?;
         sign_requests.extend(respond_requests);
 
-        if !sign_requests.is_empty() {
+        if !sign_requests.is_empty() || !respond_logs.is_empty() {
             let timestamps = sign_requests
                 .iter()
                 .map(|r| r.unix_timestamp_indexed)
@@ -1018,6 +1013,7 @@ impl EthereumIndexer {
                     block_number,
                     block_hash,
                     sign_requests.clone(),
+                    respond_logs,
                 ))
                 .await
                 .map_err(|err| anyhow::anyhow!("Failed to send indexed requests: {:?}", err))?;
@@ -1241,6 +1237,7 @@ impl EthereumIndexer {
                 block_number,
                 block_hash,
                 indexed_requests,
+                respond_logs,
             }) = requests_indexed.recv().await
             else {
                 tracing::error!("Failed to receive indexed requests");
@@ -1278,6 +1275,10 @@ impl EthereumIndexer {
                     sign_tx.clone(),
                     node_near_account_id.clone(),
                 );
+
+                if !respond_logs.is_empty() {
+                    process_respond_events(&respond_logs, &backlog, sign_tx.clone()).await;
+                }
                 if last_processed_block.is_none_or(|n| n < block_number) {
                     if let Err(err) = app_data_storage
                         .set_last_processed_block_eth(block_number)
@@ -1311,7 +1312,6 @@ impl EthereumIndexer {
         requests_indexed: mpsc::Sender<BlockAndRequests>,
         total_timeout: Duration,
         backlog: Backlog,
-        sign_tx: mpsc::Sender<Sign>,
     ) {
         loop {
             let Some(block) = blocks_failed_rx.recv().await else {
@@ -1327,7 +1327,6 @@ impl EthereumIndexer {
                 requests_indexed.clone(),
                 total_timeout,
                 backlog.clone(),
-                sign_tx.clone(),
             )
             .await
             {
