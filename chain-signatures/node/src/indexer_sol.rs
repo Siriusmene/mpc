@@ -347,6 +347,8 @@ pub async fn run(
         return;
     };
 
+    let total_timeout = Duration::from_secs(sol.total_timeout);
+
     // Wait for threshold to be available
     crate::indexer_common::recover_backlog(
         &backlog,
@@ -354,6 +356,8 @@ pub async fn run(
         &mut mesh_state,
         &node_client,
         Chain::Solana,
+        sign_tx.clone(),
+        total_timeout,
     )
     .await;
 
@@ -368,8 +372,6 @@ pub async fn run(
         sol.rpc_ws_url,
         program_id
     );
-
-    let total_timeout = Duration::from_secs(sol.total_timeout);
 
     // Clone sol for respond events subscription
     let sol_for_respond = sol.clone();

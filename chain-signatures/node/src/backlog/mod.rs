@@ -7,7 +7,7 @@ use crate::protocol::{Chain, SignRequestType};
 use crate::sign_bidirectional::{BidirectionalTx, BidirectionalTxId, PendingRequestStatus};
 use crate::storage::checkpoint_storage::CheckpointStorage;
 use anyhow::Context;
-use mpc_primitives::{PendingTx, SignId};
+use mpc_primitives::{PendingTx, SignArgs, SignId};
 use std::collections::{hash_map, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -586,7 +586,7 @@ impl Backlog {
         node_client: &NodeClient,
         threshold: usize,
         chains: &[Chain],
-    ) {
+    ) -> HashMap<Chain, HashMap<SignId, BacklogTransaction>> {
         tracing::info!("attempting to recover from latest checkpoints via node selection");
 
         // Load local checkpoints first
@@ -622,7 +622,7 @@ impl Backlog {
 
         if checkpoints.is_empty() {
             tracing::info!("no selected checkpoints found, starting with empty state");
-            return;
+            return HashMap::new();
         }
 
         for (chain, checkpoint) in checkpoints {
@@ -639,6 +639,17 @@ impl Backlog {
                 );
             }
         }
+
+        // Snapshot pending requests for the requested chains
+        let requests = self.requests.read().await;
+        let mut recovered = HashMap::new();
+        for &chain in chains {
+            if let Some(pending) = requests.get(&chain) {
+                recovered.insert(chain, pending.requests.clone());
+            }
+        }
+
+        recovered
     }
 }
 
@@ -656,16 +667,17 @@ pub enum BacklogError {
 }
 
 /// Sign request transaction metadata (non-bidirectional).
-#[derive(Debug, Clone, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SignTx {
     pub request_id: [u8; 32],
     pub source_chain: Chain,
-    pub key_version: u32,
     pub status: PendingRequestStatus,
+    pub args: SignArgs,
+    pub unix_timestamp_indexed: u64,
 }
 
 /// Pending transaction in the backlog - can be either a sign-only or bidirectional.
-#[derive(Debug, Clone, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum BacklogTransaction {
     Sign(SignTx),
