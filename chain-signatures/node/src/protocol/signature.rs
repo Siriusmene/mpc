@@ -3,6 +3,7 @@ use crate::backlog::Backlog;
 use crate::config::Config;
 use crate::kdf::derive_delta;
 use crate::mesh::MeshState;
+use crate::metrics::node_account_id;
 use crate::protocol::contract::primitives::intersect_vec;
 use crate::protocol::message::{
     MessageChannel, PositMessage, PositProtocolId, SignatureMessage, Subscriber,
@@ -32,8 +33,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
-
-use near_account_id::AccountId;
 
 /// The round interval to search for a proposer in the organizing phase.
 const ROUND_INTERVAL: usize = 512;
@@ -264,7 +263,7 @@ impl SignOrganizer {
 
             if is_mine && state.round == 0 {
                 crate::metrics::requests::NUM_SIGN_REQUESTS_MINE
-                    .with_label_values(&[ctx.my_account_id.as_str()])
+                    .with_label_values(&[node_account_id()])
                     .inc();
             }
 
@@ -720,7 +719,7 @@ impl SignGenerating {
 
         // Track that we've created a generator
         crate::metrics::protocols::NUM_TOTAL_HISTORICAL_SIGNATURE_GENERATORS
-            .with_label_values(&[ctx.my_account_id.as_str()])
+            .with_label_values(&[node_account_id()])
             .inc();
 
         match generator.run(ctx).await {
@@ -811,7 +810,7 @@ impl SignGenerator {
             msg: ctx.msg.clone(),
             #[cfg(feature = "debug-page")]
             debug_view: crate::web::debug::register_task(
-                ctx.my_account_id.to_string(),
+                node_account_id().to_string(),
                 format!("SignatureGenerator {sign_id:#?}"),
             ),
         })
@@ -840,28 +839,27 @@ impl SignGenerator {
     }
 
     async fn run(mut self, ctx: &SignTask) -> Result<(), SignError> {
-        let my_account_id = &ctx.my_account_id;
         let me = ctx.me;
         let epoch = ctx.epoch;
 
         let accrued_wait_delay = crate::metrics::protocols::SIGNATURE_ACCRUED_WAIT_DELAY
-            .with_label_values(&[my_account_id.as_str()]);
-        let poke_counts = crate::metrics::protocols::SIGNATURE_POKES_CNT
-            .with_label_values(&[my_account_id.as_str()]);
+            .with_label_values(&[node_account_id()]);
+        let poke_counts =
+            crate::metrics::protocols::SIGNATURE_POKES_CNT.with_label_values(&[node_account_id()]);
         let signature_generator_failures_metric =
             crate::metrics::protocols::SIGNATURE_GENERATOR_FAILURES
-                .with_label_values(&[my_account_id.as_str()]);
+                .with_label_values(&[node_account_id()]);
         let signature_generator_failures_mine_metric =
             crate::metrics::protocols::SIGNATURE_GENERATOR_MINE_FAILURES
-                .with_label_values(&[my_account_id.as_str()]);
+                .with_label_values(&[node_account_id()]);
         let signature_generator_success_metric =
             crate::metrics::protocols::SIGNATURE_GENERATOR_SUCCESS
-                .with_label_values(&[my_account_id.as_str()]);
+                .with_label_values(&[node_account_id()]);
         let signature_generator_success_mine_metric =
             crate::metrics::protocols::SIGNATURE_GENERATOR_MINE_SUCCESS
-                .with_label_values(&[my_account_id.as_str()]);
+                .with_label_values(&[node_account_id()]);
         let poke_latency = crate::metrics::protocols::SIGNATURE_POKE_CPU_TIME
-            .with_label_values(&[my_account_id.as_str()]);
+            .with_label_values(&[node_account_id()]);
 
         let sign_id = self.indexed.id;
         let presignature_id = self.dropper.id;
@@ -870,7 +868,7 @@ impl SignGenerator {
         let mut total_pokes = 0;
         let mut poke_last_time = self.created;
         crate::metrics::protocols::SIGNATURE_BEFORE_POKE_DELAY
-            .with_label_values(&[my_account_id.as_str()])
+            .with_label_values(&[node_account_id()])
             .observe(self.created.elapsed().as_millis() as f64);
 
         loop {
@@ -964,7 +962,7 @@ impl SignGenerator {
                     accrued_wait_delay.observe(total_wait.as_millis() as f64);
                     poke_counts.observe(total_pokes as f64);
                     crate::metrics::protocols::SIGN_GENERATION_LATENCY
-                        .with_label_values(&[my_account_id.as_str()])
+                        .with_label_values(&[node_account_id()])
                         .observe(self.created.elapsed().as_secs_f64());
                     signature_generator_success_metric.inc();
 
@@ -1026,7 +1024,6 @@ struct SignTask {
     threshold: usize,
     public_key: PublicKey,
     epoch: u64,
-    my_account_id: AccountId,
     presignatures: PresignatureStorage,
     msg: MessageChannel,
     rpc: RpcChannel,
@@ -1116,7 +1113,6 @@ pub struct SignatureSpawner {
     mesh_state: watch::Receiver<MeshState>,
 
     me: Participant,
-    my_account_id: AccountId,
     threshold: usize,
     public_key: PublicKey,
     epoch: u64,
@@ -1142,7 +1138,6 @@ impl SignatureSpawner {
         // if the signature is not completed within the expected response time
         let chain = indexed.chain;
         let timestamp_sign_queue = indexed.timestamp_sign_queue;
-        let my_account_id = self.my_account_id.clone();
         let expected_response_time = Duration::from_secs(chain.expected_response_time_secs());
         let already_elapsed = timestamp_sign_queue.elapsed();
         let remaining_time = expected_response_time.saturating_sub(already_elapsed);
@@ -1159,7 +1154,7 @@ impl SignatureSpawner {
                     "signature request delayed beyond expected response time"
                 );
                 crate::metrics::requests::NUM_SIGN_REQUESTS_MINE_DELAYED
-                    .with_label_values(&[chain.as_str(), my_account_id.as_str()])
+                    .with_label_values(&[chain.as_str(), node_account_id()])
                     .inc();
             });
             self.delayed_watchers.insert(sign_id, watcher);
@@ -1174,7 +1169,6 @@ impl SignatureSpawner {
             threshold: self.threshold,
             public_key: self.public_key,
             epoch: self.epoch,
-            my_account_id: self.my_account_id.clone(),
             presignatures: self.presignatures.clone(),
             msg: self.msg.clone(),
             rpc: self.rpc.clone(),
@@ -1257,7 +1251,7 @@ impl SignatureSpawner {
                 }
 
                 crate::metrics::requests::NUM_UNIQUE_SIGN_REQUESTS
-                    .with_label_values(&[indexed.chain.as_str(), self.my_account_id.as_str()])
+                    .with_label_values(&[indexed.chain.as_str(), node_account_id()])
                     .inc();
 
                 self.spawn_task(indexed, participants.clone(), contract.clone(), cfg.clone());
@@ -1266,7 +1260,7 @@ impl SignatureSpawner {
 
         // Update metrics
         crate::metrics::requests::SIGN_QUEUE_SIZE
-            .with_label_values(&[self.my_account_id.as_str()])
+            .with_label_values(&[node_account_id()])
             .set(self.tasks.len() as i64);
     }
 
@@ -1352,7 +1346,6 @@ impl SignatureSpawnerTask {
             tasks: JoinMap::new(),
             inboxes: HashMap::new(),
             delayed_watchers: HashMap::new(),
-            my_account_id: ctx.my_account_id.clone(),
             threshold,
             public_key,
             epoch,

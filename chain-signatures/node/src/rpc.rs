@@ -2,6 +2,7 @@ use crate::backlog::Backlog;
 use crate::config::{Config, ContractConfig, NetworkConfig};
 use crate::indexer_eth::EthConfig;
 use crate::indexer_sol::SolConfig;
+use crate::metrics::node_account_id;
 use crate::protocol::contract::primitives::{ParticipantMap, Participants};
 use crate::protocol::contract::RunningContractState;
 use crate::protocol::{Chain, Governance, IndexedSignRequest, ProtocolState, SignRequestType};
@@ -385,7 +386,6 @@ impl RpcExecutor {
         });
 
         let eth_client = self.client(&Chain::Ethereum);
-        let near_account_id_clone = self.near.my_account_id.clone();
         let (eth_rpc_tx, eth_rpc_rx) = mpsc::channel(MAX_CONCURRENT_RPC_REQUESTS);
         // spin up update task for batch sending eth responses
         tokio::spawn({
@@ -394,7 +394,6 @@ impl RpcExecutor {
                 eth_rpc_rx,
                 ETH_RESPOND_BATCH_INTERVAL,
                 ETH_RESPOND_BATCH_SIZE,
-                near_account_id_clone.clone(),
             )
         });
 
@@ -407,14 +406,13 @@ impl RpcExecutor {
 
             let chain = action.indexed.chain;
             let client = self.client(&chain);
-            let near_account_id = self.near.my_account_id.clone();
             let eth_rpc_tx = eth_rpc_tx.clone(); // clone for task use
             let backlog = self.backlog.clone();
 
             tokio::spawn(async move {
                 match chain {
                     Chain::NEAR | Chain::Solana | Chain::Hydration => {
-                        execute_publish(client, action, near_account_id, backlog).await;
+                        execute_publish(client, action, backlog).await;
                     }
                     Chain::Ethereum => {
                         if let Err(err) = eth_rpc_tx.send(action).await {
@@ -460,7 +458,6 @@ pub struct NearClient {
     client: near_fetch::Client,
     contract_id: AccountId,
     my_addr: Url,
-    my_account_id: AccountId,
     signer: InMemorySigner,
     cipher_pk: hpke::PublicKey,
     sign_pk: near_crypto::PublicKey,
@@ -492,7 +489,6 @@ impl NearClient {
             client: near_fetch::Client::new(near_rpc),
             contract_id: contract_id.clone(),
             my_addr: my_addr.clone(),
-            my_account_id: signer.account_id.clone(),
             signer,
             cipher_pk: network.cipher_sk.public_key(),
             sign_pk: network.sign_sk.public_key(),
@@ -907,12 +903,7 @@ async fn update_config(near: NearClient, config: watch::Sender<Config>) {
 }
 
 /// Publish the signature and retry if it fails
-async fn execute_publish(
-    client: ChainClient,
-    mut action: PublishAction,
-    near_account_id: AccountId,
-    backlog: Backlog,
-) {
+async fn execute_publish(client: ChainClient, mut action: PublishAction, backlog: Backlog) {
     let chain = action.indexed.chain;
     let sign_id = action.indexed.id;
     tracing::info!(
@@ -987,20 +978,18 @@ async fn execute_publish(
     };
 
     let chain_str = chain.as_str();
-    let account_str = near_account_id.as_str();
-
     if publish_result.is_ok() {
         let elapsed = action.indexed.timestamp_sign_queue.elapsed();
         if elapsed.as_secs() <= chain.expected_response_time_secs() {
             crate::metrics::requests::NUM_SIGN_REQUESTS_MINE_IN_TIME
-                .with_label_values(&[chain_str, account_str])
+                .with_label_values(&[chain_str, node_account_id()])
                 .inc();
         }
         crate::metrics::requests::SIGN_TOTAL_LATENCY
-            .with_label_values(&[chain_str, account_str])
+            .with_label_values(&[chain_str, node_account_id()])
             .observe(elapsed.as_secs_f64());
         crate::metrics::requests::SIGN_RESPOND_LATENCY
-            .with_label_values(&[chain_str, account_str])
+            .with_label_values(&[chain_str, node_account_id()])
             .observe(action.timestamp.elapsed().as_secs_f64());
     }
 
@@ -1021,7 +1010,6 @@ async fn run_batch_respond(
     mut actions_rx: mpsc::Receiver<PublishAction>,
     batch_interval: Duration,
     batch_size: usize,
-    near_account_id: AccountId,
 ) {
     let mut start = Instant::now();
     let mut actions_batch: Vec<PublishAction> = vec![];
@@ -1035,13 +1023,7 @@ async fn run_batch_respond(
                 num_requests = actions_batch.len(),
                 "publishing batch of signatures",
             );
-            execute_batch_publish(
-                &client,
-                &mut actions_batch,
-                &near_account_id,
-                Instant::now(),
-            )
-            .await;
+            execute_batch_publish(&client, &mut actions_batch, Instant::now()).await;
             start = Instant::now();
         }
         if let Ok(action) = actions_rx.try_recv() {
@@ -1405,14 +1387,12 @@ async fn try_batch_publish_eth(
         num_requests,
         "eth batch published ethereum signatures successfully"
     );
-
     Ok(())
 }
 
 async fn execute_batch_publish(
     client: &ChainClient,
     actions: &mut Vec<PublishAction>,
-    near_account_id: &AccountId,
     start: Instant,
 ) {
     let mut signatures: HashMap<SignId, Signature> = HashMap::new();
@@ -1465,15 +1445,15 @@ async fn execute_batch_publish(
                 let elapsed = action.indexed.timestamp_sign_queue.elapsed();
                 if elapsed.as_secs() <= chain.expected_response_time_secs() {
                     crate::metrics::requests::NUM_SIGN_REQUESTS_MINE_IN_TIME
-                        .with_label_values(&[chain.as_str(), near_account_id.as_str()])
+                        .with_label_values(&[chain.as_str(), node_account_id()])
                         .inc();
                 }
                 crate::metrics::requests::SIGN_TOTAL_LATENCY
-                    .with_label_values(&[chain.as_str(), near_account_id.as_str()])
+                    .with_label_values(&[chain.as_str(), node_account_id()])
                     .observe(elapsed.as_secs_f64());
             }
             crate::metrics::requests::SIGN_RESPOND_LATENCY
-                .with_label_values(&[Chain::Ethereum.as_str(), near_account_id.as_str()])
+                .with_label_values(&[Chain::Ethereum.as_str(), node_account_id()])
                 .observe(start.elapsed().as_secs_f64());
             actions.clear();
             break;
