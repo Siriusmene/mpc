@@ -134,7 +134,7 @@ impl TripleGenerator {
                 Err(err) => {
                     crate::metrics::protocols::TRIPLE_GENERATOR_FAILURES.inc();
                     if self.proposer == self.me {
-                        crate::metrics::protocols::TRIPLE_GENERATOR_MINE_FAILURES.inc();
+                        crate::metrics::protocols::TRIPLE_GENERATOR_OWNED_FAILURES.inc();
                     }
                     tracing::warn!(
                         id = self.id,
@@ -160,7 +160,7 @@ impl TripleGenerator {
                     let Some(msg) = self.recv().await else {
                         crate::metrics::protocols::TRIPLE_GENERATOR_FAILURES.inc();
                         if self.proposer == self.me {
-                            crate::metrics::protocols::TRIPLE_GENERATOR_MINE_FAILURES.inc();
+                            crate::metrics::protocols::TRIPLE_GENERATOR_OWNED_FAILURES.inc();
                         }
                         break;
                     };
@@ -233,6 +233,7 @@ impl TripleGenerator {
                     tracing::debug!(
                         id = self.id,
                         me = ?self.me,
+                        proposer = ?self.proposer,
                         ?triple_owner,
                         pair_is_mine,
                         participants = ?self.participants,
@@ -242,10 +243,9 @@ impl TripleGenerator {
                         "completed triple pair generation"
                     );
 
-                    if pair_is_mine {
-                        crate::metrics::protocols::NUM_TOTAL_HISTORICAL_TRIPLE_GENERATIONS_MINE_SUCCESS.inc();
+                    if self.proposer == self.me {
+                        crate::metrics::protocols::NUM_TOTAL_HISTORICAL_TRIPLE_GENERATIONS_OWNED_SUCCESS.inc();
                     }
-
                     let pair = TriplePair {
                         id: self.id,
                         triple0: first,
