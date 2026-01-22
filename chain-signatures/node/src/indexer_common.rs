@@ -7,7 +7,7 @@ use crate::indexer_hydration::{
 };
 use crate::mesh::wait_threshold_active;
 use crate::mesh::MeshState;
-use crate::metrics::node_account_id;
+
 use crate::node_client::NodeClient;
 use crate::protocol::Chain;
 use crate::protocol::IndexedSignRequest;
@@ -275,7 +275,7 @@ pub(crate) async fn process_sign_event(
         tracing::error!(?err, chain = %chain, "Failed to send {} sign request into queue", chain.as_str());
     } else {
         crate::metrics::requests::NUM_SIGN_REQUESTS
-            .with_label_values(&[sign_event.source_chain().as_str(), node_account_id()])
+            .with_label_values(&[sign_event.source_chain().as_str()])
             .inc();
     }
 
@@ -504,6 +504,7 @@ mod tests {
     use cait_sith::protocol::Participant;
     use k256::ProjectivePoint;
     use mpc_primitives::SignArgs;
+    use near_primitives::types::AccountId;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
