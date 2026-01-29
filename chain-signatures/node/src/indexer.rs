@@ -122,7 +122,7 @@ impl NearIndexer {
             },
             chain: Chain::NEAR,
             unix_timestamp_indexed: crate::util::current_unix_timestamp(),
-            timestamp_sign_queue: Instant::now(),
+            timestamp_created: Instant::now(),
             total_timeout: Duration::from_secs(200),
             sign_request_type: crate::protocol::SignRequestType::Sign,
         }
@@ -199,10 +199,6 @@ async fn poll_pending_requests(ctx: &mut Context) -> anyhow::Result<()> {
         );
         if let Err(err) = ctx.sign_tx.send(Sign::Request(request)).await {
             tracing::error!(?err, "failed to send the sign request into sign queue");
-        } else {
-            crate::metrics::requests::NUM_SIGN_REQUESTS
-                .with_label_values(&[Chain::NEAR.as_str()])
-                .inc();
         }
     }
 
