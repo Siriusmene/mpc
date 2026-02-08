@@ -7,6 +7,7 @@ use crate::protocol::{Chain, IndexedSignRequest, Sign, SignRequestType};
 use crate::rpc::ContractStateWatcher;
 use crate::sign_bidirectional::hash_rlp_data;
 
+use crate::util::retry::{retry_async, RetryConfig, RetryError, RetryReason};
 use alloy_sol_types::SolValue;
 use anchor_client::anchor_lang::AnchorDeserialize;
 use anchor_client::{Client, Cluster, Program};
@@ -529,23 +530,11 @@ async fn subscribe_and_process_sign_events(
     }
 }
 
-async fn parse_cpi_events(
-    rpc_client: &RpcClient,
-    signature: &Signature,
+fn parse_cpi_events(
+    tx: solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
     target_program_id: &Pubkey,
 ) -> Result<Vec<SignatureEventBox>> {
     use solana_transaction_status::{UiInstruction, UiParsedInstruction};
-
-    let tx = rpc_client
-        .get_transaction_with_config(
-            signature,
-            solana_client::rpc_config::RpcTransactionConfig {
-                encoding: Some(solana_transaction_status::UiTransactionEncoding::JsonParsed),
-                commitment: Some(CommitmentConfig::confirmed()),
-                max_supported_transaction_version: Some(0),
-            },
-        )
-        .await?;
 
     let Some(meta) = tx.transaction.meta else {
         return Ok(Vec::new());
@@ -647,59 +636,97 @@ where
 
     let (mut stream, _unsubscriber) = pubsub_client.logs_subscribe(filter, config).await?;
 
+    // stall watchdog
+    let stall_timeout = Duration::from_secs(60);
+    let mut last_ws_msg = Instant::now();
+    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
+
     // Simple TTL cache to avoid multiple getTransaction calls for the same signature
     let mut seen: HashMap<Signature, Instant> = HashMap::new();
     let ttl = Duration::from_secs(30);
 
     let target_program_str = program_id.to_string();
     let program_invoke_str = format!("Program {} invoke [", target_program_str);
-    while let Some(response) = stream.next().await {
-        if response.value.err.is_some() {
-            continue;
-        }
 
-        let logs = &response.value.logs;
-        if !looks_like_cpi_sign_event(logs) || !has_log_starts_with(logs, &program_invoke_str) {
-            continue;
-        }
+    loop {
+        cleanup_seen_cache(&mut seen, ttl);
+        tokio::select! {
+            // Receive WS logs
+            maybe = stream.next() => {
+                match maybe {
+                    Some(response) => {
+                        last_ws_msg = Instant::now();
 
-        let Ok(signature) = Signature::from_str(&response.value.signature) else {
-            tracing::warn!("Invalid signature format");
-            continue;
-        };
-        let now = Instant::now();
-        // Periodic cleanup of expired entries in the TTL cache
-        seen.retain(|_, &mut timestamp| now.duration_since(timestamp) < ttl);
-        if seen.contains_key(&signature) {
-            continue;
-        }
-        seen.insert(signature, now);
+                        if response.value.err.is_some() {
+                            continue;
+                        }
 
-        if let Ok(events) = parse_cpi_events(&rpc_client, &signature, &program_id).await {
-            for ev in events {
-                event_handler(ev, signature, response.context.slot);
+                        let logs = &response.value.logs;
+                        if !looks_like_cpi_sign_event(logs) || !has_log_starts_with(logs, &program_invoke_str) {
+                            continue;
+                        }
+
+                        let Ok(signature) = Signature::from_str(&response.value.signature) else {
+                            tracing::warn!("Invalid signature format");
+                            continue;
+                        };
+
+                        if seen.contains_key(&signature) {
+                            continue;
+                        }
+
+                        let tx = match get_tx(&rpc_client, &signature, RetryConfig::default()).await {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch transaction {}: {}", signature, e);
+                                continue;
+                            }
+                        };
+
+                        let now = Instant::now();
+                        seen.insert(signature, now);
+
+                        match parse_cpi_events(tx, &program_id) {
+                            Ok(events) => {
+                                for ev in events {
+                                    event_handler(ev, signature, response.context.slot);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse cpi events for {}: {}", signature, e);
+                                continue;
+                            }
+                        }
+
+                        if let Some(checkpoint) = backlog
+                            .set_processed_block(Chain::Solana, response.context.slot)
+                            .await
+                        {
+                            tracing::info!(slot = response.context.slot, ?checkpoint, "created Solana checkpoint");
+                        }
+
+                        crate::metrics::indexers::LATEST_BLOCK_NUMBER
+                            .with_label_values(&[Chain::Solana.as_str(), "indexed"])
+                            .set(response.context.slot as i64);
+                    }
+                    None => {
+                        // stream ended => force reconnect
+                        anyhow::bail!("solana logs stream ended (None), reconnecting");
+                    }
+                }
+            }
+
+            // Watchdog tick
+            _ = watchdog.tick() => {
+                if last_ws_msg.elapsed() > stall_timeout {
+                    anyhow::bail!(
+                        "solana logs subscription stalled: no ws message for {:?}",
+                        stall_timeout
+                    );
+                }
             }
         }
-
-        // Create checkpoint if one was created at this slot
-        if let Some(checkpoint) = backlog
-            .set_processed_block(Chain::Solana, response.context.slot)
-            .await
-        {
-            tracing::info!(
-                slot = response.context.slot,
-                ?checkpoint,
-                "created Solana checkpoint"
-            );
-        }
-
-        // Update block height metric
-        crate::metrics::indexers::LATEST_BLOCK_NUMBER
-            .with_label_values(&[Chain::Solana.as_str(), "indexed"])
-            .set(response.context.slot as i64);
     }
-
-    Ok(())
 }
 
 fn looks_like_cpi_sign_event(logs: &[String]) -> bool {
@@ -711,23 +738,11 @@ fn has_log_starts_with(logs: &[String], start_with: &str) -> bool {
     logs.iter().any(|l| l.starts_with(start_with))
 }
 
-async fn parse_cpi_respond_events(
-    rpc_client: &RpcClient,
-    signature: &Signature,
+fn parse_cpi_respond_events(
+    tx: solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
     target_program_id: &Pubkey,
 ) -> Result<(Vec<RespondBidirectionalEvent>, Vec<SignatureRespondedEvent>)> {
     use solana_transaction_status::{UiInstruction, UiParsedInstruction};
-
-    let tx = rpc_client
-        .get_transaction_with_config(
-            signature,
-            solana_client::rpc_config::RpcTransactionConfig {
-                encoding: Some(solana_transaction_status::UiTransactionEncoding::JsonParsed),
-                commitment: Some(CommitmentConfig::confirmed()),
-                max_supported_transaction_version: Some(0),
-            },
-        )
-        .await?;
 
     let Some(meta) = tx.transaction.meta else {
         return Ok((Vec::new(), Vec::new()));
@@ -843,65 +858,103 @@ async fn subscribe_to_program_respond_events(
 
     let (mut stream, _unsubscriber) = pubsub_client.logs_subscribe(filter, config).await?;
 
-    // Simple TTL cache to avoid multiple getTransaction calls for the same signature
+    // TTL cache: avoid repeated getTransaction on same sig
     let mut seen: HashMap<Signature, Instant> = HashMap::new();
     let ttl = Duration::from_secs(30);
 
+    // Watchdog: force reconnect if WS goes silent
+    let stall_timeout = Duration::from_secs(60);
+    let mut last_ws_msg = Instant::now();
+    let mut watchdog = tokio::time::interval(Duration::from_secs(5));
+
     let program_invoke_log = format!("Program {program_id} invoke [");
-    while let Some(response) = stream.next().await {
-        if response.value.err.is_some() {
-            continue;
-        }
 
-        let logs = &response.value.logs;
-        if !has_log_starts_with(logs, &program_invoke_log) {
-            continue;
-        }
+    loop {
+        cleanup_seen_cache(&mut seen, ttl);
 
-        let Ok(signature) = Signature::from_str(&response.value.signature) else {
-            tracing::warn!("Invalid signature format");
-            continue;
-        };
-        let now = Instant::now();
-        // Periodic cleanup of expired entries in the TTL cache
-        seen.retain(|_, &mut timestamp| now.duration_since(timestamp) < ttl);
-        if seen.contains_key(&signature) {
-            continue;
-        }
-        seen.insert(signature, now);
+        tokio::select! {
+            maybe = stream.next() => {
+                match maybe {
+                    Some(response) => {
+                        last_ws_msg = Instant::now();
 
-        let Ok((respond_bidirectional_events, respond_events)) =
-            parse_cpi_respond_events(&rpc_client, &signature, &program_id).await
-        else {
-            continue;
-        };
-        for ev in respond_bidirectional_events {
-            if let Err(err) = crate::indexer_common::process_respond_bidirectional_event(
-                crate::indexer_common::RespondBidirectionalEvent::Solana(ev),
-                sign_tx.clone(),
-                &backlog,
-            )
-            .await
-            {
-                tracing::error!(?err, "failed to process respond bidirectional event");
+                        if response.value.err.is_some() {
+                            continue;
+                        }
+
+                        let logs = &response.value.logs;
+                        if !has_log_starts_with(logs, &program_invoke_log) {
+                            continue;
+                        }
+
+                        let Ok(signature) = Signature::from_str(&response.value.signature) else {
+                            tracing::warn!("Invalid signature format");
+                            continue;
+                        };
+
+                        if seen.contains_key(&signature) {
+                            continue;
+                        }
+
+                        let tx = match get_tx(&rpc_client, &signature, RetryConfig::default()).await {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch transaction {}: {}", signature, e);
+                                continue;
+                            }
+                        };
+
+                        let now = Instant::now();
+                        seen.insert(signature, now);
+
+                        let (respond_bidirectional_events, respond_events) = match parse_cpi_respond_events(tx, &program_id) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                tracing::warn!(?err, sig = %signature, "failed to parse respond events (will skip this signature)");
+                                continue;
+                            }
+                        };
+
+                        for ev in respond_bidirectional_events {
+                            if let Err(err) = crate::indexer_common::process_respond_bidirectional_event(
+                                crate::indexer_common::RespondBidirectionalEvent::Solana(ev),
+                                sign_tx.clone(),
+                                &backlog,
+                            ).await {
+                                tracing::error!(?err, "failed to process respond bidirectional event");
+                            }
+                        }
+
+                        for ev in respond_events {
+                            if let Err(err) = crate::indexer_common::process_respond_event(
+                                crate::indexer_common::SignatureRespondedEvent::Solana(ev),
+                                sign_tx.clone(),
+                                &mut contract_watcher,
+                                &backlog,
+                            ).await {
+                                tracing::error!(?err, "failed to process respond event");
+                            }
+                        }
+                    }
+                    None => {
+                        anyhow::bail!("solana respond logs stream ended (None), reconnecting");
+                    }
+                }
             }
-        }
 
-        for ev in respond_events {
-            if let Err(err) = crate::indexer_common::process_respond_event(
-                crate::indexer_common::SignatureRespondedEvent::Solana(ev),
-                sign_tx.clone(),
-                &mut contract_watcher,
-                &backlog,
-            )
-            .await
-            {
-                tracing::error!(?err, "failed to process respond event");
+            _ = watchdog.tick() => {
+                if last_ws_msg.elapsed() > stall_timeout {
+                    anyhow::bail!("solana respond logs subscription stalled: no ws message for {:?}", stall_timeout);
+                }
             }
         }
     }
+}
 
-    Ok(())
+// Clean up seen cache based on TTL
+fn cleanup_seen_cache(seen: &mut HashMap<Signature, Instant>, ttl: Duration) {
+    let now = Instant::now();
+    seen.retain(|_, &mut t| now.duration_since(t) < ttl);
 }
 
 pub fn to_mpc_signature(
@@ -928,4 +981,68 @@ pub fn to_mpc_signature(
         s,
         recovery_id: sig.recovery_id,
     })
+}
+
+/// Fetch transaction with timeout + retry.
+/// Returns the same type as `RpcClient::get_transaction_with_config`.
+async fn get_tx(
+    rpc_client: &RpcClient,
+    signature: &Signature,
+    retry_cfg: RetryConfig,
+) -> anyhow::Result<solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta> {
+    let max_attempts = retry_cfg.max_attempts;
+
+    let res = retry_async(
+        retry_cfg,
+        |attempt| async move {
+            rpc_client
+                .get_transaction_with_config(
+                    signature,
+                    solana_client::rpc_config::RpcTransactionConfig {
+                        encoding: Some(solana_transaction_status::UiTransactionEncoding::JsonParsed),
+                        commitment: Some(CommitmentConfig::confirmed()),
+                        max_supported_transaction_version: Some(0),
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(e).context(format!(
+                        "getTransaction failed (attempt {attempt}/{}) for {}",
+                        max_attempts, signature
+                    ))
+                })
+        },
+        |_attempt, _reason| true,
+        |attempt, reason, sleep| match reason {
+            RetryReason::Error(e) => {
+                tracing::warn!(
+                    "getTransaction failed (attempt {attempt}/{}) for {}: {e:#}; retrying in {sleep:?}",
+                    max_attempts,
+                    signature
+                );
+            }
+            RetryReason::Timeout(t) => {
+                tracing::warn!(
+                    "getTransaction timed out after {t:?} (attempt {attempt}/{}) for {}; retrying in {sleep:?}",
+                    max_attempts,
+                    signature
+                );
+            }
+        },
+    )
+    .await;
+
+    match res {
+        Ok(tx) => Ok(tx),
+        Err(RetryError::Exhausted { last_error, .. }) => Err(last_error),
+        Err(RetryError::TimeoutExhausted {
+            attempts,
+            last_timeout,
+        }) => Err(anyhow::anyhow!(
+            "getTransaction timed out after {:?} (attempt {attempts}/{}) for {}",
+            last_timeout,
+            max_attempts,
+            signature
+        )),
+    }
 }
