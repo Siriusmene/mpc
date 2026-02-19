@@ -152,10 +152,16 @@ async fn test_triple_persistence() -> anyhow::Result<()> {
             .await;
     }
 
-    // Let's say Node1 somehow used up triple 10, 11, 12 so we only have 13,14,15
-    let mut outdated = triple_storage.remove_outdated(node1, &[13, 14, 15]).await;
+    // Let's say Node1 somehow used up triple 10, 11, 12 so we only have 13,14,15.
+    // We also include ID 99 which doesn't exist to test the not_found tracking.
+    let result = triple_storage
+        .remove_outdated(node1, &[13, 14, 15, 99])
+        .await
+        .unwrap();
+    let mut outdated = result.removed;
     outdated.sort();
     assert_eq!(outdated, vec![10, 11, 12]);
+    assert_eq!(result.not_found, vec![99]);
 
     assert_eq!(triple_storage.len_generated().await, 8);
     assert_eq!(triple_spawner.len_mine().await, 5);
@@ -291,12 +297,16 @@ async fn test_presignature_persistence() -> anyhow::Result<()> {
             .await;
     }
 
-    // Let's say Node1 somehow used up triple 10, 11, 12 so we only have 13,14,15
-    let mut outdated = presignature_storage
-        .remove_outdated(node1, &[13, 14, 15])
-        .await;
+    // Let's say Node1 somehow used up triple 10, 11, 12 so we only have 13,14,15.
+    // We also include ID 99 which doesn't exist to test the not_found tracking.
+    let result = presignature_storage
+        .remove_outdated(node1, &[13, 14, 15, 99])
+        .await
+        .unwrap();
+    let mut outdated = result.removed;
     outdated.sort();
     assert_eq!(outdated, vec![10, 11, 12]);
+    assert_eq!(result.not_found, vec![99]);
 
     assert_eq!(presignature_storage.len_generated().await, 8);
     assert_eq!(presignature_spawner.len_mine().await, 5);
