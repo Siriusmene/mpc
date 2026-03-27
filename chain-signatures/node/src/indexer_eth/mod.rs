@@ -147,27 +147,44 @@ impl fmt::Debug for EthConfig {
 #[derive(Debug, Clone, clap::Parser)]
 #[group(id = "indexer_eth_options")]
 pub struct EthArgs {
+    // -- Core --
     /// The ethereum account secret key used to sign eth respond txn.
-    #[arg(long, env("MPC_ETH_ACCOUNT_SK"))]
-    pub eth_account_sk: Option<String>,
-    /// Ethereum WebSocket RPC URL
-    #[clap(
+    #[arg(
         long,
-        env("MPC_ETH_CONSENSUS_RPC_HTTP_URL"),
-        requires = "eth_account_sk"
+        env("MPC_ETH_ACCOUNT_SK"),
+        requires_all = ["eth_execution_rpc_http_url", "eth_contract_address"]
     )]
-    pub eth_consensus_rpc_http_url: Option<String>,
-    /// Ethereum EXECUTION RPC URL
+    pub eth_account_sk: Option<String>,
+    /// The contract address to watch without the `0x` prefix
+    #[clap(long, env("MPC_ETH_CONTRACT_ADDRESS"), requires = "eth_account_sk")]
+    pub eth_contract_address: Option<String>,
+
+    // -- RPC endpoints --
+    /// Ethereum execution RPC URL
     #[clap(
         long,
         env("MPC_ETH_EXECUTION_RPC_HTTP_URL"),
         requires = "eth_account_sk"
     )]
     pub eth_execution_rpc_http_url: Option<String>,
-    /// The contract address to watch without the `0x` prefix
-    #[clap(long, env("MPC_ETH_CONTRACT_ADDRESS"), requires = "eth_account_sk")]
-    pub eth_contract_address: Option<String>,
-    /// the network that the eth indexer is running on. Either "sepolia"/"mainnet"
+
+    // -- Helios light-client --
+    /// Use Helios light client instead of direct RPC
+    #[clap(
+        long,
+        env("MPC_ETH_LIGHT_CLIENT"),
+        default_value = "false",
+        requires_if("true", "eth_consensus_rpc_http_url")
+    )]
+    pub eth_light_client: bool,
+    /// Ethereum consensus RPC URL (required when --eth-light-client is set)
+    #[clap(
+        long,
+        env("MPC_ETH_CONSENSUS_RPC_HTTP_URL"),
+        requires = "eth_account_sk"
+    )]
+    pub eth_consensus_rpc_http_url: Option<String>,
+    /// The network that the eth indexer is running on. Either "sepolia"/"mainnet"
     #[clap(
         long,
         env("MPC_ETH_NETWORK"),
@@ -176,7 +193,7 @@ pub struct EthArgs {
         value_parser = ["sepolia", "mainnet"],
     )]
     pub eth_network: Option<String>,
-    /// helios light client data path
+    /// Helios light client data path
     #[clap(
         long,
         env("MPC_ETH_HELIOS_DATA_PATH"),
@@ -184,7 +201,9 @@ pub struct EthArgs {
         default_value = "/helios/sepolia"
     )]
     pub eth_helios_data_path: Option<String>,
-    /// refresh finalized block interval in milliseconds
+
+    // -- Behaviour --
+    /// Refresh finalized block interval in milliseconds
     #[clap(
         long,
         env("MPC_ETH_REFRESH_FINALIZED_INTERVAL"),
@@ -195,9 +214,6 @@ pub struct EthArgs {
     /// Useful for testing where we do not want to reach finality due to how long it takes.
     #[clap(long, env("MPC_ETH_OPTIMISTIC_REQUESTS"), default_value = "false")]
     pub eth_optimistic_requests: bool,
-    /// light client is true if using helios, false if using direct rpc
-    #[clap(long, env("MPC_ETH_LIGHT_CLIENT"), default_value = "false")]
-    pub eth_light_client: bool,
 }
 
 impl EthArgs {
@@ -245,12 +261,12 @@ impl EthArgs {
     pub fn into_config(self) -> Option<EthConfig> {
         Some(EthConfig {
             account_sk: self.eth_account_sk?,
-            consensus_rpc_http_url: self.eth_consensus_rpc_http_url?,
-            execution_rpc_http_url: self.eth_execution_rpc_http_url?,
-            contract_address: self.eth_contract_address?,
-            network: self.eth_network?,
-            helios_data_path: self.eth_helios_data_path?,
-            refresh_finalized_interval: self.eth_refresh_finalized_interval?,
+            consensus_rpc_http_url: self.eth_consensus_rpc_http_url.unwrap_or_default(),
+            execution_rpc_http_url: self.eth_execution_rpc_http_url.unwrap(),
+            contract_address: self.eth_contract_address.unwrap(),
+            network: self.eth_network.unwrap_or_default(),
+            helios_data_path: self.eth_helios_data_path.unwrap_or_default(),
+            refresh_finalized_interval: self.eth_refresh_finalized_interval.unwrap(),
             optimistic_requests: self.eth_optimistic_requests,
             light_client: self.eth_light_client,
         })
@@ -1325,9 +1341,18 @@ pub struct EthereumStream {
 impl EthereumStream {
     pub async fn new(eth: Option<EthConfig>, backlog: Backlog) -> anyhow::Result<Self> {
         let Some(eth) = eth else {
-            tracing::warn!("ethereum indexer is disabled");
-            return Err(anyhow::anyhow!("ethereum indexer is disabled"));
+            tracing::warn!(
+                "ethereum indexer is disabled: no EthConfig provided \
+                 (check that all --eth-* CLI flags were supplied)"
+            );
+            return Err(anyhow::anyhow!(
+                "ethereum indexer is disabled: no EthConfig provided"
+            ));
         };
+        tracing::info!(
+            eth_config = ?eth,
+            "creating ethereum indexer stream"
+        );
 
         let (events_tx, events_rx) = crate::stream::channel();
         let indexer = EthereumIndexer::new(eth, backlog).await?;
