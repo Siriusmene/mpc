@@ -557,10 +557,6 @@ impl TripleSpawner {
     /// Generate new triples if this node owns fewer than the per-node minimum
     /// (`min_triples`) and the network-wide total hasn't reached the cap (`max_triples`).
     async fn stockpile(&mut self, participants: &[Participant], cfg: &ProtocolConfig) {
-        if participants.len() < self.threshold {
-            return;
-        }
-
         let not_enough_triples = {
             // Network-wide cap: stop generating once total potential triples reach max_triples.
             if self.len_potential().await >= cfg.triple.max_triples as usize {
@@ -590,6 +586,7 @@ impl TripleSpawner {
 
         let mut active = mesh_state.borrow().active().keys_vec();
         let mut protocol = cfg.borrow().protocol.clone();
+        let mut last_active_warn = None;
 
         loop {
             tokio::select! {
@@ -618,22 +615,28 @@ impl TripleSpawner {
                     self.ongoing_introduced.remove(&id);
                     let _ = ongoing_gen_tx.send(self.ongoing.len());
                 }
-                _ = stockpile_interval.tick(), if active.len() >= self.threshold => {
-                    self.stockpile(&active, &protocol).await;
-                    let _ = ongoing_gen_tx.send(self.ongoing.len());
+                _ = stockpile_interval.tick() => {
+                    if active.len() >= self.threshold {
+                        last_active_warn = None;
+                        self.stockpile(&active, &protocol).await;
+                        let _ = ongoing_gen_tx.send(self.ongoing.len());
 
-                    crate::metrics::storage::NUM_TRIPLES_MINE
-
-                        .set(self.len_mine().await as i64);
-                    crate::metrics::storage::NUM_TRIPLES_TOTAL
-
-                        .set(self.triple_storage.len_generated().await as i64);
-                    crate::metrics::protocols::NUM_TRIPLE_GENERATORS_INTRODUCED
-
-                        .set(self.len_introduced() as i64);
-                    crate::metrics::protocols::NUM_TRIPLE_GENERATORS_TOTAL
-
-                        .set(self.len_ongoing() as i64);
+                        crate::metrics::storage::NUM_TRIPLES_MINE
+                            .set(self.len_mine().await as i64);
+                        crate::metrics::storage::NUM_TRIPLES_TOTAL
+                            .set(self.triple_storage.len_generated().await as i64);
+                        crate::metrics::protocols::NUM_TRIPLE_GENERATORS_INTRODUCED
+                            .set(self.len_introduced() as i64);
+                        crate::metrics::protocols::NUM_TRIPLE_GENERATORS_TOTAL
+                            .set(self.len_ongoing() as i64);
+                    } else if last_active_warn.is_none_or(|i: Instant| i.elapsed() > Duration::from_secs(60)) {
+                        tracing::warn!(
+                            ?active,
+                            threshold = self.threshold,
+                            "not enough active participants to generate triples"
+                        );
+                        last_active_warn = Some(Instant::now());
+                    }
                 }
                 Ok(()) = cfg.changed() => {
                     protocol = cfg.borrow().protocol.clone();
