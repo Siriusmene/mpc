@@ -407,7 +407,6 @@ pub(crate) async fn process_respond_event(
         request_id: respond_event.request_id(),
         from_address,
         nonce,
-        status: SignStatus::AwaitingResponse,
     };
 
     tracing::info!(
@@ -492,7 +491,7 @@ pub async fn process_execution_confirmed(
     );
 
     // Remove the watcher; if it's not found, it might have been processed already
-    let Some((unwatched_sign_id, mut pending_tx)) =
+    let Some((unwatched_sign_id, pending_tx)) =
         backlog.unwatch_execution(target_chain, &tx_id).await
     else {
         tracing::warn!(
@@ -523,7 +522,6 @@ pub async fn process_execution_confirmed(
     };
     tracing::info!(?tx_id, ?unwatched_sign_id, updated_status = ?updated_tx.status(), "set_status returned transaction");
 
-    pending_tx.status = status;
     let completed_tx = CompletedTx::new(pending_tx, block_height);
 
     let sign_request = match result {
@@ -699,7 +697,6 @@ mod tests {
             request_id: [1u8; 32],
             from_address: Address::ZERO,
             nonce: 0,
-            status: SignStatus::PendingExecution,
         };
         let sign_id = SignId::new(tx.request_id);
 
@@ -875,7 +872,6 @@ mod tests {
             request_id: [2u8; 32],
             from_address: Address::ZERO,
             nonce: 0,
-            status: SignStatus::PendingExecution,
         };
         let sign_id = SignId::new(tx.request_id);
 
