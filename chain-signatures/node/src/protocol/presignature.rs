@@ -375,10 +375,6 @@ impl PresignatureSpawner {
         self.ongoing.contains_key(&id)
     }
 
-    pub async fn contains_used(&self, id: PresignatureId) -> bool {
-        self.presignatures.contains_used(id).await
-    }
-
     /// Returns the number of unspent presignatures available in the manager.
     pub async fn len_generated(&self) -> usize {
         self.presignatures.len_generated().await
@@ -480,7 +476,7 @@ impl PresignatureSpawner {
         // to use the same triple as any other node.
         // TODO: have all this part be a separate task such that finding a pair of triples is done in parallel instead
         // of waiting for storage to respond here.
-        let Some(triples) = self.triples.take_mine(self.me).await else {
+        let Some(triples) = self.triples.take_mine().await else {
             return;
         };
 
@@ -566,9 +562,10 @@ impl PresignatureSpawner {
             "starting protocol to generate a new presignature",
         );
 
-        let Some(slot) = self.presignatures.reserve(id.id).await else {
+        let Some(slot) = self.presignatures.create_slot(id.id, owner).await else {
             return Err(InitializationError::BadParameters(format!(
-                "id collision: presignature_id={id:?}"
+                "presignature {} is already generating, in use, or stored",
+                id.id
             )));
         };
 
@@ -696,6 +693,7 @@ impl PresignatureSpawner {
     ) {
         let mut last_active_warn: Option<Instant> = None;
         let mut stockpile_interval = time::interval(Duration::from_millis(100));
+        stockpile_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut expiration_interval = tokio::time::interval(Duration::from_secs(1));
         let mut posits = self.msg.subscribe_presignature_posit().await;
 
