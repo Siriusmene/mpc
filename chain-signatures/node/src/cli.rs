@@ -7,6 +7,7 @@ use crate::mesh::Mesh;
 use crate::node_client::{self, NodeClient};
 use crate::protocol::message::MessageChannel;
 use crate::protocol::presignature::Presignature;
+use crate::protocol::signature::SignatureSpawnerTask;
 use crate::protocol::state::Node;
 use crate::protocol::sync::SyncTask;
 use crate::protocol::{spawn_system_metrics, MpcSignProtocol};
@@ -26,8 +27,7 @@ use mpc_keys::hpke;
 use near_account_id::AccountId;
 use near_crypto::{InMemorySigner, PublicKey, SecretKey};
 use sha3::Digest;
-use std::sync::Arc;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, watch};
 use url::Url;
 
 const DEFAULT_WEB_PORT: u16 = 3000;
@@ -357,21 +357,29 @@ pub async fn run(cmd: Cli) -> anyhow::Result<()> {
             let msg_channel =
                 MessageChannel::spawn(client.clone(), config_rx.clone(), contract_watcher.clone())
                     .await;
+            let sign_task = SignatureSpawnerTask::run(
+                account_id.clone(),
+                sign_rx,
+                contract_watcher.clone(),
+                config_rx.clone(),
+                presignature_storage.clone(),
+                mesh_state.clone(),
+                msg_channel.clone(),
+                rpc_channel.clone(),
+                backlog.clone(),
+            );
             let protocol = MpcSignProtocol {
                 my_account_id: account_id.clone(),
-                rpc_channel,
                 msg_channel: msg_channel.clone(),
                 generating: msg_channel.subscribe_generation().await,
                 resharing: msg_channel.subscribe_resharing().await,
                 ready: msg_channel.subscribe_ready().await,
-                sign_rx: Arc::new(RwLock::new(sign_rx)),
+                sign_task,
                 secret_storage: key_storage,
                 triple_storage: triple_storage.clone(),
                 presignature_storage: presignature_storage.clone(),
-                contract: contract_watcher.clone(),
                 config: config_rx,
                 mesh_state: mesh_state.clone(),
-                backlog: backlog.clone(),
             };
 
             tracing::info!("protocol initialized");

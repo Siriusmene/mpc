@@ -7,6 +7,7 @@ use crate::protocol::contract::primitives::{ParticipantMap, Participants};
 use crate::protocol::contract::RunningContractState;
 use crate::protocol::{Chain, Governance, IndexedSignRequest, ProtocolState, SignKind};
 use crate::util::AffinePointExt as _;
+use std::collections::BTreeSet;
 
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
@@ -131,6 +132,16 @@ pub enum RpcAction {
     Publish(PublishAction),
 }
 
+#[derive(Debug, Clone)]
+pub struct GovernanceInfo {
+    pub me: Participant,
+    pub threshold: usize,
+    pub epoch: u64,
+    pub public_key: mpc_crypto::PublicKey,
+    pub participants: BTreeSet<Participant>,
+    pub is_running: bool,
+}
+
 #[derive(Clone)]
 pub struct RpcChannel {
     pub tx: mpsc::Sender<RpcAction>,
@@ -225,6 +236,19 @@ impl ContractStateWatcher {
 
     pub fn state(&self) -> Option<ProtocolState> {
         self.borrow_state().clone()
+    }
+
+    pub fn governance(&self) -> Option<GovernanceInfo> {
+        self.state()?.governance(&self.account_id)
+    }
+
+    pub async fn wait_governance(&mut self) -> GovernanceInfo {
+        loop {
+            if let Some(governance) = self.governance() {
+                return governance;
+            }
+            let _ = self.contract_state.changed().await;
+        }
     }
 
     pub async fn next_state(&mut self) -> Option<ProtocolState> {
@@ -2051,6 +2075,10 @@ async fn try_publish_canton(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::contract::primitives::{ParticipantInfo, Participants};
+    use crate::protocol::contract::{ResharingContractState, RunningContractState};
+    use crate::protocol::ProtocolState;
+    use cait_sith::protocol::Participant;
     use k256::elliptic_curve::ops::Reduce;
     use k256::elliptic_curve::point::DecompressPoint;
     use mpc_crypto::kdf::derive_secret_key;
@@ -2097,6 +2125,69 @@ mod tests {
             unix_timestamp_indexed: 0,
             kind: SignKind::Sign,
         }
+    }
+
+    fn test_participants() -> Participants {
+        let mut participants = Participants::default();
+        participants.insert(&Participant::from(0), ParticipantInfo::new(0));
+        participants.insert(&Participant::from(1), ParticipantInfo::new(1));
+        participants.insert(&Participant::from(2), ParticipantInfo::new(2));
+        participants
+    }
+
+    #[tokio::test]
+    async fn wait_governance_tracks_resharing_state() {
+        let account_id: AccountId = "p-0".parse().unwrap();
+        let participants = test_participants();
+        let (mut watcher, tx) = ContractStateWatcher::new(&account_id);
+
+        let initial = RunningContractState {
+            epoch: 0,
+            public_key: AffinePoint::default(),
+            participants: participants.clone(),
+            candidates: Default::default(),
+            join_votes: Default::default(),
+            leave_votes: Default::default(),
+            threshold: 2,
+        };
+        tx.send(Some(ProtocolState::Running(initial))).unwrap();
+
+        let governance = watcher.governance().expect("running governance");
+        assert_eq!(governance.epoch, 0);
+        assert_eq!(governance.threshold, 2);
+        assert_eq!(governance.me, Participant::from(0));
+
+        let resharing = ResharingContractState {
+            old_epoch: 0,
+            old_participants: participants.clone(),
+            new_participants: participants.clone(),
+            threshold: 2,
+            public_key: AffinePoint::default(),
+            finished_votes: Default::default(),
+            cancel_votes: Default::default(),
+        };
+        tx.send(Some(ProtocolState::Resharing(resharing))).unwrap();
+
+        let paused = watcher.governance().expect("resharing governance");
+        assert_eq!(paused.epoch, 1);
+        assert_eq!(paused.threshold, 2);
+        assert_eq!(paused.me, Participant::from(0));
+
+        let running = RunningContractState {
+            epoch: 1,
+            public_key: AffinePoint::default(),
+            participants,
+            candidates: Default::default(),
+            join_votes: Default::default(),
+            leave_votes: Default::default(),
+            threshold: 2,
+        };
+        tx.send(Some(ProtocolState::Running(running))).unwrap();
+
+        let resumed = watcher.wait_governance().await;
+        assert_eq!(resumed.epoch, 1);
+        assert_eq!(resumed.threshold, 2);
+        assert_eq!(resumed.me, Participant::from(0));
     }
 
     #[test]
