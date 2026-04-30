@@ -21,7 +21,7 @@ async fn stream_canton(sandbox: &CantonSandbox, backlog: Backlog) -> Result<Cant
     let config = sandbox.get_config();
     let mut stream =
         CantonStream::new(Some(config), backlog).context("failed to create CantonStream")?;
-    ChainStream::start(&mut stream).await;
+    ChainStream::start(&mut stream).await?;
     Ok(stream)
 }
 

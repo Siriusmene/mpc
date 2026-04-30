@@ -415,7 +415,6 @@ pub async fn run(
         &mut mesh_state,
         &node_client,
         Chain::Hydration,
-        sign_tx.clone(),
     )
     .await;
 
@@ -515,6 +514,7 @@ pub async fn run(
                     entropy,
                     sign_tx.clone(),
                     backlog.clone(),
+                    true,
                 )
                 .await
                 {
@@ -539,6 +539,7 @@ pub async fn run(
                     sign_tx.clone(),
                     &mut contract_watcher,
                     &backlog,
+                    true,
                 )
                 .await
                 {
@@ -569,6 +570,7 @@ pub async fn run(
                     entropy,
                     sign_tx.clone(),
                     backlog.clone(),
+                    true,
                 )
                 .await
                 {
@@ -594,6 +596,7 @@ pub async fn run(
                     crate::stream::ops::RespondBidirectionalEvent::Hydration(event),
                     sign_tx.clone(),
                     &backlog,
+                    true,
                 )
                 .await
                 {

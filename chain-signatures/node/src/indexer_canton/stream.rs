@@ -2,9 +2,10 @@ use crate::backlog::Backlog;
 use crate::protocol::Chain;
 use crate::rpc::CantonClient;
 use crate::stream::ops::{RespondBidirectionalEvent, SignatureEvent, SignatureRespondedEvent};
-use crate::stream::{ChainEvent, ChainStream};
+use crate::stream::{ChainEvent, ChainStream, DisabledChainIndexer};
 
 use alloy::primitives::keccak256;
+use async_trait::async_trait;
 
 use futures_util::{SinkExt, StreamExt};
 use mpc_primitives::{ScalarExt, Signature};
@@ -64,17 +65,23 @@ impl CantonStream {
     }
 }
 
+#[async_trait]
 impl ChainStream for CantonStream {
     const CHAIN: Chain = Chain::Canton;
+    type Indexer = DisabledChainIndexer;
 
-    async fn start(&mut self) {
+    async fn start(&mut self) -> anyhow::Result<Self::Indexer> {
         let Some(state) = self.start_state.take() else {
-            return;
+            anyhow::bail!("canton stream already started");
         };
 
         self.tasks.push(tokio::spawn(async move {
             run_canton_event_loop(state.config, state.events_tx, state.backlog).await;
         }));
+
+        // Canton stream manages its own catchup signaling from the websocket loop.
+        // Return a silent indexer so generic catchup_then_livestream stays inert.
+        Ok(DisabledChainIndexer::silent())
     }
 
     async fn next_event(&mut self) -> Option<ChainEvent> {
