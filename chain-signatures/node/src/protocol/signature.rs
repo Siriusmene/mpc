@@ -39,6 +39,9 @@ use tokio::task::JoinHandle;
 /// The round interval to search for a proposer in the organizing phase.
 const ROUND_INTERVAL: usize = 512;
 
+/// Max number of concurrent proposers, with unlimited deliberators.
+const MAX_CONCURRENT_PROPOSERS: usize = 4;
+
 /// The default timeout budget for organizing and posit phases.
 ///
 /// Tests have stable network conditions and don't benefit from a longer
@@ -138,7 +141,7 @@ enum SignError {
 }
 
 #[derive(Debug)]
-enum SignLimitError {
+pub enum SignLimitError {
     Timeout,
     Closed,
 }
@@ -150,19 +153,19 @@ struct SignLimitState {
 }
 
 #[derive(Clone, Debug)]
-struct SignLimiter {
+pub struct SignLimiter {
     semaphore: Arc<Semaphore>,
     state: Arc<RwLock<SignLimitState>>,
 }
 
 #[derive(Debug)]
-struct SignPermit {
+pub struct SignPermit {
     permit: Option<OwnedSemaphorePermit>,
     state: Arc<RwLock<SignLimitState>>,
 }
 
 impl SignLimiter {
-    fn new(limit: usize) -> Self {
+    pub fn new(limit: usize) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(limit)),
             state: Arc::new(RwLock::new(SignLimitState { limit, debt: 0 })),
@@ -170,7 +173,7 @@ impl SignLimiter {
     }
 
     /// Updates the limits for concurrent slots
-    fn update(&self, new_limit: usize) {
+    pub fn update(&self, new_limit: usize) {
         let mut state = match self.state.write() {
             Ok(state) => state,
             Err(err) => {
@@ -206,7 +209,7 @@ impl SignLimiter {
 
     /// Try to acquire a spot with a timeout just in case we do not receive the slot in time.
     /// Returns a permit if successful, error otherwise.
-    async fn acquire(&self, timeout: Duration) -> Result<SignPermit, SignLimitError> {
+    pub async fn acquire(&self, timeout: Duration) -> Result<SignPermit, SignLimitError> {
         let permit =
             match tokio::time::timeout(timeout, self.semaphore.clone().acquire_owned()).await {
                 Ok(Ok(permit)) => permit,
@@ -221,7 +224,7 @@ impl SignLimiter {
         })
     }
 
-    fn limits(&self) -> usize {
+    pub fn limits(&self) -> usize {
         match self.state.read() {
             Ok(state) => state.limit,
             Err(err) => {
@@ -1597,8 +1600,6 @@ impl SignatureSpawner {
                 }
                 Ok(()) = cfg.changed() => {
                     protocol = cfg.borrow().protocol.clone();
-                    self.limiter
-                        .update(protocol.signature.max_concurrent_proposers as usize);
                 }
                 Some(state) = contract_watcher.next_state() => {
                     if let Some(new_governance) = state.governance(&self.node_account_id) {
@@ -1634,7 +1635,6 @@ impl SignatureSpawnerTask {
         rpc_channel: RpcChannel,
         backlog: Backlog,
     ) -> Self {
-        let max_concurrent_proposers = config.borrow().protocol.signature.max_concurrent_proposers;
         let spawner = SignatureSpawner {
             contract,
             tasks: JoinMap::new(),
@@ -1642,7 +1642,7 @@ impl SignatureSpawnerTask {
             delayed_watchers: HashMap::new(),
             presignatures: presignature_storage,
             mesh_state,
-            limiter: SignLimiter::new(max_concurrent_proposers as usize),
+            limiter: SignLimiter::new(MAX_CONCURRENT_PROPOSERS),
             msg: msg_channel,
             rpc: rpc_channel,
             backlog,
