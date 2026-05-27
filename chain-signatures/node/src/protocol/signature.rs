@@ -1534,7 +1534,11 @@ impl SignatureSpawner {
         }
 
         // Subscribe to (or create) the posit inbox for this sign request
-        let rx = self.inboxes.entry(sign_id).or_default().subscribe();
+        let rx = self
+            .inboxes
+            .entry(sign_id)
+            .or_insert_with(|| Subscriber::unsubscribed("sign_task"))
+            .subscribe();
         let task = SignTask {
             governance: governance.clone(),
             sign_id,
@@ -1571,7 +1575,7 @@ impl SignatureSpawner {
         let _ = self
             .inboxes
             .entry(sign_id)
-            .or_default()
+            .or_insert_with(|| Subscriber::unsubscribed("sign_task"))
             .send(SignTaskMessage::PositMessage {
                 presignature_id,
                 round,
@@ -1582,7 +1586,9 @@ impl SignatureSpawner {
     }
 
     fn handle_completion(&mut self, sign_id: SignId) {
-        self.inboxes.remove(&sign_id);
+        if let Some(inbox) = self.inboxes.remove(&sign_id) {
+            inbox.clear_capacity_global();
+        }
         self.abort_delayed_watcher(sign_id, "completion");
         if self.tasks.abort(sign_id) {
             tracing::info!(?sign_id, "aborting signature task due to completion event");
@@ -1597,13 +1603,16 @@ impl SignatureSpawner {
             Ok(outcome) => outcome,
             Err(sign_id) => {
                 tracing::warn!(?sign_id, "signature task interrupted");
-                self.inboxes.remove(&sign_id);
+                if let Some(inbox) = self.inboxes.remove(&sign_id) {
+                    inbox.clear_capacity_global();
+                }
                 self.abort_delayed_watcher(sign_id, "interruption");
                 return;
             }
         };
-
-        self.inboxes.remove(&sign_id);
+        if let Some(inbox) = self.inboxes.remove(&sign_id) {
+            inbox.clear_capacity_global();
+        }
         self.abort_delayed_watcher(sign_id, "task completion");
         match result {
             Ok(()) => {
