@@ -810,6 +810,17 @@ impl EthereumClient {
         }
     }
 
+    pub async fn trace_transaction_output(
+        &self,
+        tx_hash: alloy::primitives::B256,
+    ) -> anyhow::Result<alloy::primitives::Bytes> {
+        match self {
+            #[cfg(feature = "helios")]
+            EthereumClient::Helios(client) => client.trace_transaction_output(tx_hash).await,
+            EthereumClient::DirectRpc(client) => client.trace_transaction_output(tx_hash).await,
+        }
+    }
+
     pub async fn call(
         &self,
         from: Address,
@@ -873,6 +884,16 @@ pub struct EthereumIndexer {
     contract_address: Address,
     catchup_complete: Arc<Notify>,
     live_blocks_rx: Option<mpsc::Receiver<MaybeBlock>>,
+}
+
+/// Result of a `backfill_execution_confirmation`. `Observed` carries an
+/// optional event; the staleness check skips observed watchers so a mined tx
+/// with a failed extraction can stay pending for retry. `NotObserved` covers
+/// "no receipt yet" (pending or replaced).
+#[allow(clippy::large_enum_variant)] // value is consumed in one match arm; never stored.
+enum BackfillOutcome {
+    NotObserved,
+    Observed { event: Option<ChainEvent> },
 }
 
 impl EthereumIndexer {
@@ -1054,7 +1075,7 @@ impl EthereumIndexer {
         pending_tx: &crate::sign_bidirectional::BidirectionalTx,
         block_number: u64,
         receipt: &alloy::rpc::types::TransactionReceipt,
-    ) -> ChainEvent {
+    ) -> Option<ChainEvent> {
         let receipt_succeeded = receipt.status();
 
         tracing::info!(
@@ -1065,7 +1086,7 @@ impl EthereumIndexer {
         );
 
         let result = if receipt_succeeded {
-            let completed_tx = CompletedTx::new(pending_tx.clone(), block_number);
+            let completed_tx = CompletedTx::new(pending_tx.clone());
             match completed_tx.extract_success_tx_output(&self.client).await {
                 Ok(serialized_output) => {
                     tracing::info!(
@@ -1078,26 +1099,33 @@ impl EthereumIndexer {
                     }
                 }
                 Err(err) => {
-                    tracing::warn!(
+                    // Return `None` to retry on the next block; fabricating
+                    // `Success { output: vec![] }` here would silently sign a
+                    // wrong response. The caller tracks observed-but-unresolved
+                    // watchers so the staleness check below skips them.
+                    tracing::error!(
                         ?tx_id,
                         ?sign_id,
                         ?err,
-                        "Failed to extract transaction output for bidirectional tx, using empty output"
+                        "Failed to extract transaction output for bidirectional \
+                         tx; leaving watcher pending for retry. Common causes: \
+                         trace RPC unavailable, malformed trace response, or \
+                         invalid output/response serialization schema."
                     );
-                    ExecutionOutcome::Success { output: vec![] }
+                    return None;
                 }
             }
         } else {
             ExecutionOutcome::Failed
         };
 
-        ChainEvent::ExecutionConfirmed {
+        Some(ChainEvent::ExecutionConfirmed {
             tx_id,
             sign_id,
             source_chain: pending_tx.source_chain,
             block_height: block_number,
             result,
-        }
+        })
     }
 
     async fn backfill_execution_confirmation(
@@ -1106,13 +1134,13 @@ impl EthereumIndexer {
         sign_id: SignId,
         pending_tx: &crate::sign_bidirectional::BidirectionalTx,
         current_block_number: u64,
-    ) -> anyhow::Result<Option<ChainEvent>> {
+    ) -> anyhow::Result<BackfillOutcome> {
         let Some(tx) = self.client.get_transaction_by_hash(tx_id.0).await? else {
-            return Ok(None);
+            return Ok(BackfillOutcome::NotObserved);
         };
 
         let Some(mined_block_number) = tx.block_number else {
-            return Ok(None);
+            return Ok(BackfillOutcome::NotObserved);
         };
 
         if mined_block_number > current_block_number {
@@ -1123,7 +1151,7 @@ impl EthereumIndexer {
                 current_block_number,
                 "skipping late watcher backfill for future ethereum block"
             );
-            return Ok(None);
+            return Ok(BackfillOutcome::NotObserved);
         }
 
         let Some(block_receipts) = self
@@ -1137,7 +1165,7 @@ impl EthereumIndexer {
                 mined_block_number,
                 "late watcher backfill found mined transaction without block receipts"
             );
-            return Ok(None);
+            return Ok(BackfillOutcome::NotObserved);
         };
 
         let Some(receipt) = block_receipts
@@ -1150,7 +1178,7 @@ impl EthereumIndexer {
                 mined_block_number,
                 "late watcher backfill could not find transaction receipt in mined block"
             );
-            return Ok(None);
+            return Ok(BackfillOutcome::NotObserved);
         };
 
         tracing::info!(
@@ -1161,16 +1189,10 @@ impl EthereumIndexer {
             "backfilled execution confirmation for late ethereum watcher"
         );
 
-        Ok(Some(
-            self.execution_confirmed_event(
-                tx_id,
-                sign_id,
-                pending_tx,
-                mined_block_number,
-                &receipt,
-            )
-            .await,
-        ))
+        let event = self
+            .execution_confirmed_event(tx_id, sign_id, pending_tx, mined_block_number, &receipt)
+            .await;
+        Ok(BackfillOutcome::Observed { event })
     }
 
     async fn collect_execution_confirmations(
@@ -1196,29 +1218,39 @@ impl EthereumIndexer {
             "collect_execution_confirmations checking watchers"
         );
 
+        // Watchers whose receipt we saw this call, even if no event was
+        // emitted. The staleness check below skips these so a mined tx with
+        // a failed extraction stays pending for retry, not flagged Failed.
+        let mut observed_tx_ids = HashSet::new();
+
         for (tx_id, (sign_id, pending_tx)) in watchers {
             tracing::info!(?tx_id, ?sign_id, "querying receipt for bidirectional tx");
             if let Some(receipt) = block_receipts.get(&pending_tx.id.0) {
-                events.push(
-                    self.execution_confirmed_event(
-                        tx_id,
-                        sign_id,
-                        &pending_tx,
-                        block_number,
-                        receipt,
-                    )
-                    .await,
-                );
-                resolved_tx_ids.insert(tx_id);
+                observed_tx_ids.insert(tx_id);
+                if let Some(event) = self
+                    .execution_confirmed_event(tx_id, sign_id, &pending_tx, block_number, receipt)
+                    .await
+                {
+                    events.push(event);
+                    resolved_tx_ids.insert(tx_id);
+                }
+                // `None` means extraction failed — leave pending for retry.
+                // `observed_tx_ids` above exempts it from the staleness check.
                 continue;
             }
 
-            if let Some(event) = self
+            match self
                 .backfill_execution_confirmation(tx_id, sign_id, &pending_tx, block_number)
                 .await?
             {
-                events.push(event);
-                resolved_tx_ids.insert(tx_id);
+                BackfillOutcome::Observed { event } => {
+                    observed_tx_ids.insert(tx_id);
+                    if let Some(event) = event {
+                        events.push(event);
+                        resolved_tx_ids.insert(tx_id);
+                    }
+                }
+                BackfillOutcome::NotObserved => {}
             }
         }
 
@@ -1226,7 +1258,7 @@ impl EthereumIndexer {
         let remaining_pending = self.backlog.pending_execution(Chain::Ethereum).await;
 
         for (tx_id, (sign_id, tx)) in remaining_pending {
-            if resolved_tx_ids.contains(&tx_id) {
+            if resolved_tx_ids.contains(&tx_id) || observed_tx_ids.contains(&tx_id) {
                 continue;
             }
 
@@ -2011,7 +2043,7 @@ mod tests {
             dest: Chain::Ethereum.to_string(),
             params: "{}".to_string(),
             output_deserialization_schema: vec![],
-            respond_serialization_schema: vec![],
+            respond_serialization_schema: br#"[{"name":"output","type":"bool"}]"#.to_vec(),
             request_id: sign_id.request_id,
             from_address,
             nonce: 0,
