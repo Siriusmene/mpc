@@ -3179,21 +3179,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crypto_secretbox"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9d6cf87adf719ddf43a805e92c6870a531aedda35ff640442cbaf8674e141e1"
-dependencies = [
- "aead",
- "cipher",
- "generic-array",
- "poly1305",
- "salsa20",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "ctr"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6106,7 +6091,6 @@ dependencies = [
  "rand 0.8.5",
  "reqwest 0.11.27",
  "rlp",
- "secp256k1 0.28.2",
  "semver 1.0.26",
  "serde",
  "serde_json",
@@ -7471,7 +7455,6 @@ dependencies = [
  "redis",
  "reqwest 0.11.27",
  "rlp",
- "secp256k1 0.28.2",
  "semver 1.0.26",
  "serde",
  "serde-aux",
@@ -7487,7 +7470,6 @@ dependencies = [
  "sp-state-machine",
  "sp-trie",
  "subxt",
- "subxt-signer",
  "sysinfo",
  "test-log",
  "thiserror 1.0.69",
@@ -11269,15 +11251,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
-name = "salsa20"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
-dependencies = [
- "cipher",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11500,18 +11473,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "scrypt"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
-dependencies = [
- "password-hash 0.5.0",
- "pbkdf2 0.12.2",
- "salsa20",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "sct"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11631,15 +11592,6 @@ name = "secrecy"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
-dependencies = [
- "zeroize",
-]
-
-[[package]]
-name = "secrecy"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
  "zeroize",
 ]
@@ -14572,7 +14524,7 @@ dependencies = [
  "scale-info",
  "schnorrkel",
  "secp256k1 0.28.2",
- "secrecy 0.8.0",
+ "secrecy",
  "serde",
  "sha2 0.10.9",
  "sp-crypto-hashing",
@@ -15564,34 +15516,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url 2.5.4",
-]
-
-[[package]]
-name = "subxt-signer"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fb6463f7f46817043de9f20ba11f485ee474378fcdbe4150aa849274523bd1c"
-dependencies = [
- "base64 0.22.1",
- "bip39",
- "cfg-if 1.0.0",
- "crypto_secretbox",
- "hex",
- "hmac 0.12.1",
- "parity-scale-codec",
- "pbkdf2 0.12.2",
- "regex",
- "schnorrkel",
- "scrypt",
- "secp256k1 0.30.0",
- "secrecy 0.10.3",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sp-crypto-hashing",
- "subxt-core",
- "thiserror 2.0.12",
- "zeroize",
 ]
 
 [[package]]
