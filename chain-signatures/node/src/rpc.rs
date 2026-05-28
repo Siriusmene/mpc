@@ -49,7 +49,7 @@ use crate::indexer_canton::ledger_api::{
     IdentifierFilter, JsCommands, LedgerEndResponse, PartyFilter,
     SubmitAndWaitForTransactionRequest, SubmitAndWaitForTransactionResponse, TemplateFilterValue,
 };
-use crate::indexer_canton::{generate_jwt_with_key, CantonConfig};
+use crate::indexer_canton::{CantonAuthProvider, CantonConfig};
 use crate::indexer_hydration::HydrationConfig;
 use parity_scale_codec::{Decode, Encode};
 use subxt::config::substrate::{
@@ -946,14 +946,14 @@ impl HydrationClient {
 pub struct CantonClient {
     pub(crate) config: CantonConfig,
     http_client: reqwest::Client,
-    encoding_key: jsonwebtoken::EncodingKey,
+    auth_provider: CantonAuthProvider,
 }
 
 impl std::fmt::Debug for CantonClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CantonClient")
             .field("config", &self.config)
-            .field("encoding_key", &"<hidden>")
+            .field("auth_provider", &"<hidden>")
             .finish()
     }
 }
@@ -964,8 +964,7 @@ impl CantonClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
 
-        let jwt_pem = tokio::fs::read(&config.jwt_private_key_path).await?;
-        let encoding_key = jsonwebtoken::EncodingKey::from_ec_pem(&jwt_pem)?;
+        let auth_provider = CantonAuthProvider::new(config.auth.clone())?;
 
         if !config.signer_contract_id.is_empty() || !config.signer_template_id.is_empty() {
             tracing::info!(
@@ -978,36 +977,40 @@ impl CantonClient {
         Ok(Self {
             config: config.clone(),
             http_client,
-            encoding_key,
+            auth_provider,
         })
     }
 
-    pub fn jwt_subject(&self) -> &str {
-        &self.config.jwt_subject
+    pub fn ledger_api_user(&self) -> &str {
+        &self.config.ledger_api_user
     }
 
-    pub fn generate_jwt(&self) -> anyhow::Result<String> {
-        generate_jwt_with_key(&self.encoding_key, &self.config.jwt_subject)
+    pub async fn bearer_token(&self) -> anyhow::Result<String> {
+        self.auth_provider.bearer_token().await
     }
 
     fn json_api_endpoint(&self, path: &str) -> String {
         format!("{}{}", self.config.json_api_url, path)
     }
 
-    pub fn auth_post(&self, path: &str) -> anyhow::Result<reqwest::RequestBuilder> {
+    pub async fn auth_post(&self, path: &str) -> anyhow::Result<reqwest::RequestBuilder> {
+        let token = self.bearer_token().await?;
         Ok(self
             .http_client
             .post(self.json_api_endpoint(path))
-            .bearer_auth(self.generate_jwt()?))
+            .bearer_auth(token))
+    }
+
+    pub async fn auth_get(&self, path: &str) -> anyhow::Result<reqwest::RequestBuilder> {
+        let token = self.bearer_token().await?;
+        Ok(self
+            .http_client
+            .get(self.json_api_endpoint(path))
+            .bearer_auth(token))
     }
 
     pub async fn fetch_ledger_end(&self) -> anyhow::Result<u64> {
-        let resp = self
-            .http_client
-            .get(self.json_api_endpoint("/v2/state/ledger-end"))
-            .bearer_auth(self.generate_jwt()?)
-            .send()
-            .await?;
+        let resp = self.auth_get("/v2/state/ledger-end").await?.send().await?;
         let resp = check_response(resp, "ledger-end").await?;
         let body: LedgerEndResponse = resp.json().await?;
         Ok(body.offset)
@@ -1048,9 +1051,8 @@ impl CantonClient {
         };
 
         let resp = self
-            .http_client
-            .post(self.json_api_endpoint("/v2/state/active-contracts"))
-            .bearer_auth(self.generate_jwt()?)
+            .auth_post("/v2/state/active-contracts")
+            .await?
             .json(&req)
             .send()
             .await?;
@@ -1065,9 +1067,8 @@ impl CantonClient {
         context: &str,
     ) -> anyhow::Result<SubmitAndWaitForTransactionResponse> {
         let resp = self
-            .http_client
-            .post(self.json_api_endpoint("/v2/commands/submit-and-wait-for-transaction"))
-            .bearer_auth(self.generate_jwt()?)
+            .auth_post("/v2/commands/submit-and-wait-for-transaction")
+            .await?
             .json(&SubmitAndWaitForTransactionRequest { commands })
             .send()
             .await?;
@@ -1084,7 +1085,7 @@ impl CantonClient {
         use crate::indexer_canton::ledger_api::{Command, JsCommands};
         let commands = JsCommands {
             command_id: command_id.to_string(),
-            user_id: self.config.jwt_subject.clone(),
+            user_id: self.config.ledger_api_user.clone(),
             act_as: vec![self.config.party_id.clone()],
             read_as: vec![self.config.party_id.clone()],
             commands: vec![Command::ExerciseCommand {
