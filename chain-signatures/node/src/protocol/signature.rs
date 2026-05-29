@@ -57,13 +57,7 @@ const ORGANIZE_POSIT_TIMEOUT: Duration = Duration::from_secs(if cfg!(feature = "
 
 /// A proposer tries to include all eligible deliberators but will go ahead with
 /// a subset after this timeout, if above the minimum threshold.
-///
-/// Use shorter time for tests, as network delays are much smaller.
-const ACCEPT_POSIT_TIMEOUT: Duration = Duration::from_millis(if cfg!(feature = "test-feature") {
-    100
-} else {
-    500
-});
+const ACCEPT_POSIT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Metric channel label shared by every entry in `SignatureSpawner.inboxes`.
 const SIGN_POSIT_INBOX_LABEL: &str = "sign_posit_inbox";
@@ -1810,6 +1804,11 @@ impl PendingPresignature {
             }
         }
     }
+}
+
+#[cfg(feature = "test-feature")]
+pub fn organize_posit_timeout() -> Duration {
+    ORGANIZE_POSIT_TIMEOUT
 }
 
 #[cfg(test)]
