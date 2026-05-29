@@ -14,6 +14,7 @@ use crate::protocol::presignature::PresignatureId;
 use crate::protocol::SignKind;
 use crate::protocol::{Chain, ProtocolState};
 use crate::rpc::{ContractStateWatcher, GovernanceInfo, RpcChannel};
+use crate::sign_bidirectional::PublishState;
 use crate::storage::presignature_storage::{
     PresignatureReservation, PresignatureTaken, PresignatureTakenDropper,
 };
@@ -1251,7 +1252,28 @@ impl SignGenerator {
                         .observe(self.created.elapsed().as_secs_f64());
                     crate::metrics::protocols::SIGNATURE_GENERATOR_SUCCESS.inc();
 
-                    if self.proposer == me {
+                    let is_proposer = self.proposer == me;
+                    if let Some(publish) = publish_status(
+                        ctx.governance.public_key,
+                        &self.indexed,
+                        &output,
+                        self.participants.clone(),
+                        is_proposer,
+                    ) {
+                        if let Err(err) = ctx
+                            .backlog
+                            .mark_publishing(self.indexed.chain, &sign_id, publish)
+                            .await
+                        {
+                            tracing::warn!(
+                                ?sign_id,
+                                ?err,
+                                "failed to mark publishing for sign request"
+                            );
+                        }
+                    }
+
+                    if is_proposer {
                         crate::metrics::protocols::SIGNATURE_GENERATOR_MINE_SUCCESS.inc();
                         ctx.rpc.publish(
                             ctx.governance.public_key,
@@ -1286,6 +1308,30 @@ impl SignGenerator {
         };
         self.debug_view.send(markup);
     }
+}
+
+fn publish_status(
+    public_key: mpc_crypto::PublicKey,
+    indexed: &IndexedSignRequest,
+    output: &cait_sith::FullSignature<Secp256k1>,
+    participants: Vec<Participant>,
+    is_proposer: bool,
+) -> Option<PublishState> {
+    let expected_public_key = derive_key(public_key, indexed.args.epsilon);
+    let signature = crate::kdf::into_signature(
+        &expected_public_key,
+        &output.big_r,
+        &output.s,
+        indexed.args.payload,
+    )
+    .ok()?;
+    let publish = PublishState {
+        signature,
+        participants,
+        is_proposer,
+    };
+
+    Some(publish)
 }
 
 impl Drop for SignGenerator {
