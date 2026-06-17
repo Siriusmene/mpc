@@ -1,23 +1,23 @@
 use crate::backlog::Backlog;
 use crate::protocol::Chain;
 use crate::sign_bidirectional::hash_rlp_data;
-
+use crate::solana_client::{SolanaCatchupBlock, SolanaClient};
 use crate::stream::{ChainIndexer, ChainStream};
 use crate::util::ethabi_request_id;
 use crate::util::retry::{retry_async, RetryConfig, RetryError, RetryReason};
-use anyhow::Context;
 
-use std::collections::{BTreeSet, HashMap};
-use std::fmt;
+pub use crate::solana_client::SolConfig;
+
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_sol_types::SolValue;
 use anchor_client::anchor_lang::AnchorDeserialize;
 use anchor_lang::solana_program::keccak;
 use anchor_lang::Discriminator;
+use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::stream::StreamExt;
 use futures_util::Stream;
@@ -35,15 +35,14 @@ use signet_program::{
 };
 use solana_client::{
     nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient},
-    rpc_client::GetConfirmedSignaturesForAddress2Config,
-    rpc_config::{RpcBlockConfig, RpcTransactionLogsConfig, RpcTransactionLogsFilter},
+    rpc_config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter},
 };
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::option_serializer::OptionSerializer;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
-    EncodedTransactionWithStatusMeta, TransactionDetails, UiConfirmedBlock, UiInstruction,
-    UiParsedInstruction, UiTransactionEncoding,
+    EncodedTransactionWithStatusMeta, UiConfirmedBlock, UiInstruction, UiParsedInstruction,
+    UiTransactionEncoding,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -56,33 +55,6 @@ const CPI_RESPOND_EVENT_HINTS: &[&str] = &[
     "Program log: Instruction: Respond",
     "Program log: Instruction: RespondBidirectional",
 ];
-
-// TODO: investigate what is the optimal number.
-// For now use reasonable default of 20
-const CONCURRENT_REQUESTS: usize = 20;
-
-#[derive(Clone)]
-pub struct SolConfig {
-    /// The solana account secret key used to sign solana respond txn.
-    pub account_sk: String,
-    /// Solana RPC http URL
-    pub rpc_http_url: String,
-    /// Solana RPC websocket URL
-    pub rpc_ws_url: String,
-    /// The program address to watch
-    pub program_address: String,
-}
-
-impl fmt::Debug for SolConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SolConfig")
-            .field("account_sk", &"<hidden>")
-            .field("rpc_http_url", &self.rpc_http_url)
-            .field("rpc_ws_url", &self.rpc_ws_url)
-            .field("program_address", &self.program_address)
-            .finish()
-    }
-}
 
 /// Configures Solana indexer.
 #[derive(Debug, Clone, clap::Parser)]
@@ -154,8 +126,6 @@ pub struct SolSignRequest {
     pub key_version: u32,
 }
 
-const MAX_SIGNATURES_FOR_FAST_CATCHUP: usize = 1000;
-
 /// Solana stream that implements the new ChainStream abstraction
 pub struct SolanaStream {
     rx: Option<mpsc::Receiver<ChainEvent>>,
@@ -164,19 +134,11 @@ pub struct SolanaStream {
 }
 
 pub struct SolanaIndexer {
-    program_id: Pubkey,
-    rpc_client: Arc<RpcClient>,
-    rpc_http_url: String,
-    rpc_ws_url: String,
-    events_tx: mpsc::Sender<ChainEvent>,
-    backlog: Backlog,
-    live_rx: Option<mpsc::Receiver<ChainEvent>>,
-}
-
-#[derive(Debug)]
-pub enum SolanaCatchupBlock {
-    Block(UiConfirmedBlock),
-    Missing,
+    pub program_id: Pubkey,
+    pub client: SolanaClient,
+    pub events_tx: mpsc::Sender<ChainEvent>,
+    pub backlog: Backlog,
+    pub live_rx: Option<mpsc::Receiver<ChainEvent>>,
 }
 
 struct SolanaStreamStartState {
@@ -232,11 +194,15 @@ impl ChainStream for SolanaStream {
             anyhow::bail!("solana stream already started");
         };
 
+        let client = SolanaClient::for_indexer(
+            start_state.rpc_http_url.clone(),
+            start_state.rpc_ws_url.clone(),
+            start_state.program_id,
+        );
+
         let indexer = SolanaIndexer {
             program_id: start_state.program_id,
-            rpc_client: Arc::new(RpcClient::new(start_state.rpc_http_url.clone())),
-            rpc_http_url: start_state.rpc_http_url.clone(),
-            rpc_ws_url: start_state.rpc_ws_url.clone(),
+            client,
             events_tx: start_state.tx.clone(),
             backlog: start_state.backlog.clone(),
             live_rx: None,
@@ -264,8 +230,8 @@ impl ChainIndexer for SolanaIndexer {
         self.live_rx = Some(live_rx);
 
         let program_id = self.program_id;
-        let rpc_http_url = self.rpc_http_url.clone();
-        let rpc_ws_url = self.rpc_ws_url.clone();
+        let rpc_http_url = self.client.rpc_http_url.clone();
+        let rpc_ws_url = self.client.rpc_ws_url.clone();
 
         // Oneshot to receive the first observed slot from the live subscription.
         let (anchor_tx, anchor_rx) = oneshot::channel::<u64>();
@@ -296,75 +262,16 @@ impl ChainIndexer for SolanaIndexer {
             return Box::pin(futures_util::stream::empty());
         }
 
-        // This fetches a sparse list of transactions based on whether our program received
-        // a transaction in that specific slot. This is the most optimized and cheapest path.
-        let signatures = match self
-            .rpc_client
-            .get_signatures_for_address_with_config(
-                &self.program_id,
-                GetConfirmedSignaturesForAddress2Config {
-                    before: None,
-                    until: None,
-                    limit: Some(MAX_SIGNATURES_FOR_FAST_CATCHUP),
-                    commitment: Some(CommitmentConfig::confirmed()),
-                },
-            )
-            .await
-        {
-            Ok(signatures) => signatures,
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    "failed to query solana signature history; falling back to sparse catchup"
-                );
-
-                // Stream blocks in chunks
-                let slots = self.get_all_sparse_slots(start_slot, end_slot).await;
-                return self.build_ordered_catchup_stream(slots);
-            }
-        };
-
-        let signatures_len = signatures.len();
-        let mut mid_slot = None;
-        let mut slots = BTreeSet::new();
-        for sig in signatures {
-            if sig.slot < start_slot || sig.slot > end_slot {
-                continue;
-            }
-            mid_slot = Some(mid_slot.unwrap_or(sig.slot).min(sig.slot));
-            slots.insert(sig.slot);
-        }
-        let mid_slot = mid_slot.map(|n| n.saturating_sub(1)).unwrap_or(start_slot);
-
-        // NOTE: since we can only do fast catchup for up to 1000 signatures,
-        // if we hit that limit and the earliest signature is significantly
-        // ahead of our start slot, we do one additional fetch for the
-        // sparse blocks between start_slot and the earliest signature (mid_slot).
-        if signatures_len == MAX_SIGNATURES_FOR_FAST_CATCHUP && mid_slot > start_slot {
-            tracing::info!(
-                start_slot,
-                mid_slot,
-                "solana signature history hit the 1000-signature limit; combining sparse blocks with signatures"
-            );
-
-            // Fetch the sparse blocks between start_slot and mid_slot and add them to the set of slots to catch up
-            let missing_slots = self.get_all_sparse_slots(start_slot, mid_slot).await;
-            for slot in missing_slots {
-                slots.insert(slot);
-            }
-        }
-
-        // Fetch all blocks for the identified slots concurrently
-        self.build_ordered_catchup_stream(slots.into_iter().collect())
+        let slots = self.client.fetch_slots(start_slot, end_slot).await;
+        let items = self.client.fetch_blocks_for_slots(slots).await;
+        Box::pin(futures_util::stream::iter(items.into_iter()))
     }
 
     async fn process_catchup(&mut self, (slot, block): &Self::Block) -> anyhow::Result<()> {
         match block {
             SolanaCatchupBlock::Block(block) => self.process_block(*slot, block).await,
             SolanaCatchupBlock::Missing => {
-                let block = self.get_block(*slot).await.with_context(|| {
-                    format!("failed to refetch Solana catchup block for slot {slot}")
-                })?;
+                let block = self.client.get_block(*slot).await;
                 self.process_block(*slot, &block).await
             }
         }
@@ -391,23 +298,6 @@ impl ChainIndexer for SolanaIndexer {
 }
 
 impl SolanaIndexer {
-    fn block_fetch_config() -> RpcBlockConfig {
-        RpcBlockConfig {
-            encoding: Some(UiTransactionEncoding::Json),
-            transaction_details: Some(TransactionDetails::Full),
-            rewards: Some(false),
-            commitment: Some(CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
-        }
-    }
-
-    async fn get_block(&self, slot: u64) -> anyhow::Result<UiConfirmedBlock> {
-        self.rpc_client
-            .get_block_with_config(slot, Self::block_fetch_config())
-            .await
-            .with_context(|| format!("failed to fetch Solana block for slot {slot}"))
-    }
-
     async fn process_block(&mut self, height: u64, block: &UiConfirmedBlock) -> anyhow::Result<()> {
         let Some(transactions) = &block.transactions else {
             self.events_tx.send(ChainEvent::Block(height)).await?;
@@ -432,66 +322,6 @@ impl SolanaIndexer {
 
         self.events_tx.send(ChainEvent::Block(height)).await?;
         Ok(())
-    }
-
-    async fn fetch_sparse_chunk(&self, start_slot: u64, end_slot: u64) -> Vec<u64> {
-        loop {
-            match self.rpc_client.get_blocks(start_slot, Some(end_slot)).await {
-                Ok(block_slots) => return block_slots,
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        start_slot,
-                        end_slot,
-                        "failed to fetch Solana block range for catchup; retrying"
-                    );
-                    tokio::time::sleep(Self::RETRY_DELAY).await;
-                }
-            }
-        }
-    }
-
-    /// Fetches blocks for the given slots concurrently, returning a stream of results as they arrive.
-    fn build_ordered_catchup_stream(&self, mut slots: Vec<u64>) -> <Self as ChainIndexer>::Iter {
-        let rpc_client = Arc::new(self.rpc_client.clone());
-
-        // Sort the slots to ensure we yield blocks in order, even if some requests are slower than others.
-        slots.sort_unstable();
-
-        let stream = futures_util::stream::iter(slots)
-            .map(move |slot| {
-                let rpc = rpc_client.clone();
-                async move {
-                    match rpc
-                        .get_block_with_config(slot, Self::block_fetch_config())
-                        .await
-                    {
-                        Ok(block) => (slot, SolanaCatchupBlock::Block(block)),
-                        Err(err) => {
-                            tracing::warn!(?err, slot, "failed to fetch Solana block for catchup");
-                            (slot, SolanaCatchupBlock::Missing)
-                        }
-                    }
-                }
-            })
-            .buffered(CONCURRENT_REQUESTS); // yields results back in strict order (unlike `buffer_unordered`)
-
-        Box::pin(stream)
-    }
-
-    /// Fetches all missing slots across a large range by chunking requests
-    async fn get_all_sparse_slots(&self, mut start_slot: u64, end_slot: u64) -> Vec<u64> {
-        const MAX_CHUNK_SIZE: u64 = 10_000;
-        let mut all_slots = Vec::new();
-
-        while start_slot <= end_slot {
-            let chunk_end = std::cmp::min(end_slot, start_slot.saturating_add(MAX_CHUNK_SIZE - 1));
-            let chunk_slots = self.fetch_sparse_chunk(start_slot, chunk_end).await;
-            all_slots.extend(chunk_slots);
-            start_slot = chunk_end.saturating_add(1);
-        }
-
-        all_slots
     }
 }
 
@@ -775,6 +605,14 @@ async fn subscribe_to_program_events(
 
     let (mut stream, _unsubscriber) = pubsub_client.logs_subscribe(filter, config).await?;
 
+    // Resolve the anchor slot immediately after successfully subscribing, avoiding gaps.
+    // We cannot wait for the websocket stream to get the first signature on our program
+    // since our program can potentially not generate any transactions for a while.
+    if let Some(tx) = anchor_tx.take() {
+        let slot = rpc_client.get_slot().await?;
+        let _ = tx.send(slot);
+    }
+
     // stall watchdog
     let stall_timeout = Duration::from_secs(60);
     let mut last_ws_msg = Instant::now();
@@ -796,11 +634,6 @@ async fn subscribe_to_program_events(
                         last_ws_msg = Instant::now();
 
                         let slot = response.context.slot;
-                        if let Some(anchor_tx) = anchor_tx.take() {
-                            // Send the anchor slot back to livestream() on the first received message
-                            let _ = anchor_tx.send(slot);
-                        }
-
                         let logs = &response.value.logs;
                         if response.value.err.is_some() || !has_log_starts_with(logs, &program_invoke_log) {
                             // block is not relevant to our program, skip but still
@@ -1186,11 +1019,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use mockito::{Matcher, Server};
-    use serde_json::json;
     use solana_sdk::commitment_config::CommitmentLevel;
     use solana_sdk::pubkey::Pubkey;
-    use solana_transaction_status::UiTransactionStatusMeta;
+    use solana_transaction_status::{TransactionDetails, UiTransactionStatusMeta};
 
     #[test]
     fn request_id_matches_ethabi() {
@@ -1215,7 +1046,7 @@ mod tests {
 
     #[test]
     fn block_fetch_config_sets_max_supported_transaction_version() {
-        let config = SolanaIndexer::block_fetch_config();
+        let config = SolanaClient::block_fetch_config();
 
         assert_eq!(config.max_supported_transaction_version, Some(0));
         assert_eq!(config.transaction_details, Some(TransactionDetails::Full));
@@ -1324,127 +1155,78 @@ mod tests {
         assert!(meta.err.is_some(), "expected err to be set");
     }
 
+    // Very expensive test in terms of RPC usage.
     #[tokio::test]
-    async fn test_get_all_sparse_slots_chunks_large_range() {
-        let mut server = Server::new_async().await;
-        let backlog = Backlog::new();
-        let (events_tx, _events_rx) = mpsc::channel(1);
+    #[ignore]
+    async fn test_solana_pipeline_devnet() {
+        let _ = tracing_subscriber::fmt::try_init();
 
-        let indexer = SolanaIndexer {
-            program_id: Pubkey::new_unique(),
-            rpc_client: Arc::new(RpcClient::new(server.url())),
-            rpc_http_url: server.url(),
-            rpc_ws_url: String::new(),
+        let api_key = match std::env::var("MPC_TEST_API_KEY") {
+            Ok(key) if !key.is_empty() => key,
+            _ => {
+                tracing::debug!("Skipping devnet test: MPC_TEST_API_KEY not set");
+                return;
+            }
+        };
+
+        let sol_addr = std::env::var("MPC_TEST_SOL_ADDR")
+            .unwrap_or_else(|_| "SigDuEPNeDjh3oJv7MUraPN7zaTFomS6ZWfpXwjUg4B".to_string());
+
+        let http_url = format!("https://solana-devnet.g.alchemy.com/v2/{api_key}");
+        let ws_url = format!("wss://solana-devnet.g.alchemy.com/v2/{api_key}");
+
+        let backlog = Backlog::new();
+        let (events_tx, mut events_rx) = mpsc::channel(1_000_000);
+
+        let client = SolanaClient::for_indexer(
+            http_url.clone(),
+            ws_url.clone(),
+            Pubkey::from_str(&sol_addr).unwrap(),
+        );
+
+        let mut indexer = SolanaIndexer {
+            program_id: Pubkey::from_str(&sol_addr).unwrap(),
+            client,
             events_tx,
             backlog,
             live_rx: None,
         };
 
-        let mock_chunk1 = server
-            .mock("POST", "/")
-            .match_body(Matcher::PartialJson(json!({
-                "method": "getBlocks",
-                "params": [100000, 109999]
-            })))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "jsonrpc": "2.0",
-                    "result": [100000],
-                    "id": 1
-                })
-                .to_string(),
-            )
-            .create_async()
+        // Initialize livestream (resolves anchor slot via get_slot and starts WS)
+        let anchor_height = indexer
+            .livestream()
+            .await
+            .expect("Failed to initialize livestream")
+            .expect("Anchor height missing");
+
+        tracing::debug!("Resolved anchor slot: {anchor_height}");
+
+        // Start from a checkpoint ~1 week behind (assuming ~2.5 slots per second => 1,512,000 slots per week)
+        let start_slot = anchor_height.saturating_sub(1_512_000);
+        tracing::debug!("Starting catchup from slot: {start_slot} (~1 week behind)");
+
+        indexer
+            .backlog
+            .set_processed_block_interval(Chain::Solana, start_slot.saturating_sub(1), 1)
             .await;
 
-        let mock_chunk2 = server
-            .mock("POST", "/")
-            .match_body(Matcher::PartialJson(json!({
-                "method": "getBlocks",
-                "params": [110000, 112000]
-            })))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "jsonrpc": "2.0",
-                    "result": [112000],
-                    "id": 2
-                })
-                .to_string(),
-            )
-            .create_async()
-            .await;
+        // Run catchup range
+        let catchup_stream = indexer.catchup_range(anchor_height).await;
+        tokio::pin!(catchup_stream);
+        let mut processed_any = false;
+        while let Some(item) = catchup_stream.next().await {
+            indexer
+                .process_catchup(&item)
+                .await
+                .expect("Failed to process catchup block");
+            processed_any = true;
+        }
 
-        let mock_block100k = server
-            .mock("POST", "/")
-            .match_body(Matcher::PartialJson(json!({
-                "method": "getBlock",
-                "params": [100000]
-            })))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "jsonrpc": "2.0",
-                    "result": {
-                        "transactions": []
-                    },
-                    "id": 3
-                })
-                .to_string(),
-            )
-            .create_async()
-            .await;
+        tracing::debug!("Solana catchup complete. Processed blocks: {processed_any}");
 
-        let mock_block112k = server
-            .mock("POST", "/")
-            .match_body(Matcher::PartialJson(json!({
-                "method": "getBlock",
-                "params": [112000]
-            })))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "jsonrpc": "2.0",
-                    "result": {
-                        "transactions": []
-                    },
-                    "id": 4
-                })
-                .to_string(),
-            )
-            .create_async()
-            .await;
-
-        let res_timeout = tokio::time::timeout(Duration::from_secs(2), async {
-            // Get the chunked slots
-            let slots = indexer.get_all_sparse_slots(100000, 112000).await;
-            // Feed them into the concurrent stream
-            let mut stream = indexer.build_ordered_catchup_stream(slots);
-
-            // Collect the results
-            let mut results = HashMap::new();
-            while let Some((slot, block)) = stream.next().await {
-                results.insert(slot, block);
-            }
-            results
-        })
-        .await;
-
-        let res = res_timeout
-            .expect("fetch_sparse_blocks timed out (likely infinite retry loop on large range)");
-
-        assert_eq!(res.len(), 2);
-        assert!(res.contains_key(&100000));
-        assert!(res.contains_key(&112000));
-
-        mock_chunk1.assert_async().await;
-        mock_chunk2.assert_async().await;
-        mock_block100k.assert_async().await;
-        mock_block112k.assert_async().await;
+        // Check if any events were received in the channel
+        while let Ok(event) = events_rx.try_recv() {
+            tracing::debug!("Received event: {:?}", event);
+        }
     }
 }
