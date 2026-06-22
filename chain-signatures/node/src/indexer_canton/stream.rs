@@ -1,4 +1,3 @@
-use crate::backlog::Backlog;
 use crate::protocol::Chain;
 use crate::rpc::CantonClient;
 use crate::stream::{ChainIndexer, ChainStream};
@@ -9,6 +8,7 @@ use futures_util::stream::{self, SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use mpc_primitives::{
     ChainEvent, RespondBidirectionalEvent, ScalarExt, Signature, SignatureRespondedEvent,
+    StateManager,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -26,15 +26,15 @@ type CantonWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type CantonWsRead = SplitStream<CantonWs>;
 type CantonWsWrite = SplitSink<CantonWs, Message>;
 
-pub struct CantonStream {
+pub struct CantonStream<S: StateManager> {
     config: CantonConfig,
-    backlog: Backlog,
+    state_manager: S,
     events_rx: mpsc::Receiver<ChainEvent>,
     events_tx: Option<mpsc::Sender<ChainEvent>>,
 }
 
-impl CantonStream {
-    pub fn new(config: Option<CantonConfig>, backlog: Backlog) -> Option<Self> {
+impl<S: StateManager> CantonStream<S> {
+    pub fn new(config: Option<CantonConfig>, state_manager: S) -> Option<Self> {
         let config = match config {
             Some(c) => c,
             None => {
@@ -47,7 +47,7 @@ impl CantonStream {
 
         Some(CantonStream {
             config,
-            backlog,
+            state_manager,
             events_rx,
             events_tx: Some(events_tx),
         })
@@ -55,8 +55,8 @@ impl CantonStream {
 }
 
 #[async_trait]
-impl ChainStream for CantonStream {
-    type Indexer = CantonIndexer;
+impl<S: StateManager> ChainStream for CantonStream<S> {
+    type Indexer = CantonIndexer<S>;
 
     async fn start(&mut self) -> anyhow::Result<Self::Indexer> {
         let Some(events_tx) = self.events_tx.take() else {
@@ -64,7 +64,11 @@ impl ChainStream for CantonStream {
         };
 
         let client = CantonClient::new(&self.config).await?;
-        Ok(Self::Indexer::new(client, self.backlog.clone(), events_tx))
+        Ok(Self::Indexer::new(
+            client,
+            self.state_manager.clone(),
+            events_tx,
+        ))
     }
 
     async fn next_event(&mut self) -> Option<ChainEvent> {
@@ -181,23 +185,23 @@ impl CantonConnection {
     }
 }
 
-pub struct CantonIndexer {
+pub struct CantonIndexer<S: StateManager> {
     client: CantonClient,
-    backlog: Backlog,
+    state_manager: S,
     events_tx: mpsc::Sender<ChainEvent>,
     ws_conn: CantonConnection,
     last_seen_offset: u64,
 }
 
-impl CantonIndexer {
+impl<S: StateManager> CantonIndexer<S> {
     pub fn new(
         client: CantonClient,
-        backlog: Backlog,
+        state_manager: S,
         events_tx: mpsc::Sender<ChainEvent>,
     ) -> Self {
         Self {
             client,
-            backlog,
+            state_manager,
             events_tx,
             ws_conn: CantonConnection::Disconnected,
             last_seen_offset: 0,
@@ -343,15 +347,15 @@ fn catchup_offset_range(checkpoint: u64, anchor_height: u64) -> Range<u64> {
 }
 
 #[async_trait]
-impl ChainIndexer for CantonIndexer {
+impl<S: StateManager> ChainIndexer for CantonIndexer<S> {
     const CHAIN: Chain = Chain::Canton;
     type Block = u64;
     type Iter = stream::Iter<Range<u64>>;
 
     async fn livestream(&mut self) -> anyhow::Result<Option<u64>> {
         let checkpoint = self
-            .backlog
-            .processed_block(Chain::Canton)
+            .state_manager
+            .get_processed_block(Chain::Canton)
             .await
             .unwrap_or(0);
         self.last_seen_offset = checkpoint;
