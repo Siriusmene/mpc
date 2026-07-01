@@ -4,7 +4,7 @@ use crate::respond_bidirectional::CompletedTx;
 use crate::rpc::{ContractStateWatcher, RpcChannel};
 use crate::sign_bidirectional::{SignBidirectionalEventExt, SignStatus};
 use anchor_lang::prelude::Pubkey;
-use mpc_indexer_core::ChainTelemetry;
+use mpc_chain_integration_core::ChainTelemetry;
 use mpc_primitives::{
     BidirectionalTx, BidirectionalTxId, ExecutionOutcome, RespondBidirectionalEvent, SignId,
     SignKind, Signature, SignatureRespondedEvent,
@@ -443,7 +443,7 @@ mod tests {
     use alloy::primitives::{Address, B256};
     use cait_sith::protocol::Participant;
     use k256::{ProjectivePoint, Scalar};
-    use mpc_indexer_core::{NoopChainTelemetry, StateManager};
+    use mpc_chain_integration_core::{NoopChainTelemetry, StateManager};
     use mpc_primitives::{RespondBidirectionalTx, SignArgs, SignBidirectionalEvent, SignKind};
     use near_primitives::types::AccountId;
     use solana_sdk::pubkey::Pubkey;
@@ -492,8 +492,6 @@ mod tests {
             key_version: 1,
         }
     }
-
-    use crate::kdf::valid_signature;
 
     fn test_canton_sign_bidirectional_request(
         sign_id: SignId,
@@ -965,7 +963,7 @@ mod tests {
         let root_sk = k256::SecretKey::random(&mut rand::thread_rng());
         let event = SignatureRespondedEvent {
             request_id: sign_id.request_id,
-            signature: valid_signature(&root_sk, &args),
+            signature: mpc_crypto::generate_signature(&root_sk, &args),
             chain: Chain::Ethereum,
         };
 
@@ -1030,7 +1028,7 @@ mod tests {
             .await;
 
         let root_sk = k256::SecretKey::random(&mut rand::thread_rng());
-        let mut invalid_signature = valid_signature(&root_sk, &args);
+        let mut invalid_signature = mpc_crypto::generate_signature(&root_sk, &args);
         invalid_signature.s += Scalar::ONE;
 
         let event = SignatureRespondedEvent {
@@ -1074,7 +1072,7 @@ mod tests {
             .await;
 
         let root_sk = k256::SecretKey::random(&mut rand::thread_rng());
-        let signature = valid_signature(&root_sk, &args);
+        let signature = mpc_crypto::generate_signature(&root_sk, &args);
 
         let duplicate_event0 = respond_event(sign_id, signature);
         let duplicate_event1 = respond_event(sign_id, signature);
@@ -1134,7 +1132,7 @@ mod tests {
             .await;
 
         let root_sk = k256::SecretKey::random(&mut rand::thread_rng());
-        let mut invalid_signature = valid_signature(&root_sk, &args);
+        let mut invalid_signature = mpc_crypto::generate_signature(&root_sk, &args);
         invalid_signature.s += Scalar::ONE;
 
         let event = respond_event(sign_id, invalid_signature);
@@ -1172,7 +1170,7 @@ mod tests {
         let root_sk = k256::SecretKey::random(&mut rand::thread_rng());
         let event = SignatureRespondedEvent {
             request_id: sign_id.request_id,
-            signature: valid_signature(&root_sk, &args),
+            signature: mpc_crypto::generate_signature(&root_sk, &args),
             chain: Chain::Ethereum,
         };
 
@@ -1277,7 +1275,7 @@ mod tests {
         let root_sk = k256::SecretKey::random(&mut rand::thread_rng());
         let event = SignatureRespondedEvent {
             request_id: sign_id.request_id,
-            signature: valid_signature(&root_sk, &args),
+            signature: mpc_crypto::generate_signature(&root_sk, &args),
             chain: Chain::Ethereum,
         };
 

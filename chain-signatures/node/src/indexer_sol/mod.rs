@@ -3,10 +3,12 @@ mod config;
 
 pub use client::{SolanaCatchupBlock, SolanaClient, MAX_CONCURRENT_CHUNK_SIZE};
 pub use config::SolConfig;
+use mpc_chain_integration_core::NoopPublisherTelemetry;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_sol_types::SolValue;
@@ -19,12 +21,12 @@ use futures_util::stream::StreamExt;
 use futures_util::Stream;
 use k256::elliptic_curve::sec1::FromEncodedPoint;
 use k256::{AffinePoint, Scalar};
-use mpc_crypto::kdf::derive_epsilon_sol;
-use mpc_crypto::ScalarExt as _;
-use mpc_indexer_core::{
+use mpc_chain_integration_core::{
     utils::hashing::{compute_request_id, hash_payload},
     ChainIndexer, ChainStream, ChainTelemetry, StateManager,
 };
+use mpc_crypto::kdf::derive_epsilon_sol;
+use mpc_crypto::ScalarExt as _;
 use mpc_primitives::{
     Chain, ChainEvent, IndexedSignRequest, SignArgs, SignId, LATEST_MPC_KEY_VERSION,
     MAX_SECP256K1_SCALAR,
@@ -136,6 +138,7 @@ impl<S: StateManager, T: ChainTelemetry> ChainStream for SolanaStream<S, T> {
             start_state.rpc_http_url.clone(),
             start_state.rpc_ws_url.clone(),
             start_state.program_id,
+            Arc::new(NoopPublisherTelemetry), // Indexer does not publish
         );
 
         let indexer = SolanaIndexer {
@@ -975,7 +978,7 @@ mod tests {
     use crate::backlog::Backlog;
 
     use super::*;
-    use mpc_indexer_core::NoopChainTelemetry;
+    use mpc_chain_integration_core::NoopChainTelemetry;
     use solana_sdk::commitment_config::CommitmentLevel;
     use solana_sdk::pubkey::Pubkey;
     use solana_transaction_status::{
@@ -1141,6 +1144,7 @@ mod tests {
             http_url.clone(),
             ws_url.clone(),
             Pubkey::from_str(&sol_addr).unwrap(),
+            Arc::new(NoopPublisherTelemetry),
         );
 
         let mut indexer = SolanaIndexer {
